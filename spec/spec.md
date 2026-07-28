@@ -209,7 +209,12 @@ Replace regex pre-flight with a real parser behind a stable interface.
 - **FR-2.3** Three outcomes per rule: `allow` · `warn` · `block`.
 - **FR-2.4** Rules can be scoped by table pattern, actor, and environment.
 - **FR-2.5** A **risk score** (0–100) aggregated from matched rules, surfaced to
-  clients and stored in history.
+  clients and stored in history. The score **warns by default and never blocks**
+  unless a team sets `block_on_risk: true`. Named rules (unfiltered write,
+  `TRUNCATE`) still block on their own merit.
+  > 🟢 A new install never refuses work on day one just because a statement
+  > *looks* risky. Teams turn that up deliberately, in a file they can review.
+  > A tool that gets uninstalled protects nobody.
 - **FR-2.6** Overrides must be explicit, recorded, and attributed — never silent.
 
 ### FR-3 — Attribution (Layers 1 + 2)
@@ -243,6 +248,16 @@ Replace regex pre-flight with a real parser behind a stable interface.
 - **FR-4.6** Support authentication passthrough; support TLS to the upstream.
 - **FR-4.7** Overhead budget: **< 1 ms p99** added latency per statement for
   analysis (measured, not asserted).
+- **FR-4.8** A **Python SDK wrapper** (DB-API 2.0 connection/cursor proxy, plus
+  a SQLAlchemy event hook) applying the same policy for applications that cannot
+  re-point their connection string.
+  > 🟢 Two doors to the same checkpoint. Most tools can simply be told to
+  > connect somewhere else; some applications cannot, so they get a small
+  > library that does the same job from the inside.
+
+  The wrapper and the gateway **must share one policy evaluation path** — two
+  implementations of the rules would eventually disagree, and a safety rule that
+  is true in one place and false in another is worse than no rule.
 
 ### FR-5 — MySQL engine (Layer 2)
 
@@ -353,11 +368,15 @@ The specification is satisfied when all of the following hold:
 | MySQL trigger limitations (no `AFTER` on some engines, no DDL triggers) | FR-5 partially unmet | treat as a finding; document rather than paper over |
 | Central store becomes a perceived source of truth | undo run against stale data | undo only ever executes against the source DB (FR-6.4) |
 
-**Open questions for review:**
+## 12. Decisions taken at review
 
-- **Q1.** Gateway scope — PostgreSQL wire protocol only for the first release,
-  or also a driver-level SDK wrapper for apps that cannot re-point their DSN?
-- **Q2.** Should the risk score block by default above a threshold, or only warn
-  until a team explicitly opts in?
-- **Q3.** Is MySQL the right third engine, or is SQL Server more valuable for the
-  target users?
+| # | Question | Decision | Consequence |
+|---|---|---|---|
+| D-1 | Scope of the first pull request | **Phase 1 only** (policy core) | Tighter review; the gateway lands as a second PR. Nothing changes for non-CLI clients until Phase 2 |
+| D-2 | Gateway form | **Wire proxy + Python SDK wrapper** (FR-4.8) | ~40% more Phase 2 surface; both paths must share one policy evaluator |
+| D-3 | Risk-score behaviour | **Warn by default, block on opt-in** (FR-2.5) | Named rules still block; `block_on_risk` is off in the shipped default policy |
+| D-4 | Third engine | **MySQL 8** (FR-5) | Testable in our CI environment. SQL Server rejected: no server or client available here, so it would ship untested — which this spec forbids |
+
+> 🟢 These four were genuine forks in the road. They are written down with their
+> consequences so that in six months nobody has to guess why the thing is shaped
+> the way it is.

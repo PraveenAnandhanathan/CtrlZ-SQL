@@ -24,10 +24,11 @@ Four phases. Each ends in a mergeable, independently valuable state.
 | **3** | MySQL engine | v0.1 | ✅ third database supported |
 | **4** | Control plane: team history | Phases 1–3 | ✅ cross-database audit |
 
-**Recommended first pull request: Phases 1 + 2.** They form one coherent story
-("policy that actually works, enforced for every client") and Phase 2 is the
-architectural centrepiece. Phase 1 alone is a valid smaller PR if you prefer a
-tighter review.
+**Decided at review: the first pull request is Phase 1 only.** A tighter,
+reviewable change. Phase 2 follows as its own PR.
+
+> 🟢 We build the reading comprehension before we build the checkpoint that
+> depends on it, and we let you review each on its own.
 
 ---
 
@@ -153,10 +154,17 @@ about what it knows.
 
 **D2.5 — asyncio, single process, no new runtime dependency.**
 
+**D2.6 — The proxy and the SDK wrapper share one policy evaluator.** Both call
+the same `ctrlz.policy` entry point built in Phase 1. Two implementations of the
+same rules would drift, and a safety rule that holds at one door but not the
+other is worse than no rule at all.
+
 ### Deliverables
 
 - `ctrlz/gateway/` — protocol codec, connection handler, policy interceptor
 - `ctrlz gateway --listen :6543 --upstream postgresql://…`
+- `ctrlz/sdk/` — DB-API 2.0 connection/cursor wrapper + SQLAlchemy event hook
+  (FR-4.8), for applications that cannot re-point their DSN
 - Attribution injection on session start
 - Tests: real `psql` driven end-to-end; extended-protocol client via psycopg2;
   fault injection; latency benchmark against NFR-2
@@ -303,9 +311,16 @@ shipping to the control plane by default · AI query-impact explanation.
 
 ---
 
-## 10. Decisions needed before `tasks.md`
+## 10. Decisions taken at review
 
-1. **Scope of the first PR** — Phases 1+2, or Phase 1 alone?
-2. **Spec Q1** — gateway as wire proxy only, or also a driver-level SDK wrapper?
-3. **Spec Q2** — should a high risk score block by default, or warn until opted in?
-4. **Spec Q3** — MySQL or SQL Server as the third engine?
+| # | Decision | Effect on this plan |
+|---|---|---|
+| D-1 | First PR = **Phase 1 only** | §0 table updated; Phase 2 becomes a separate PR |
+| D-2 | Gateway = **wire proxy + Python SDK wrapper** | Phase 2 gains `ctrlz/sdk/` and decision D2.6 |
+| D-3 | Risk score **warns by default** | Phase 1 ships `block_on_risk: false` in the default policy |
+| D-4 | Third engine = **MySQL 8** | Phase 3 unchanged; SQL Server stays deferred (§9) |
+
+Full rationale, including what was rejected and why, is in `spec.md` §12.
+
+**Next artefact:** [`tasks.md`](./tasks.md) — the executable task breakdown for
+Phase 1.
