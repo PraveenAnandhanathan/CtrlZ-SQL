@@ -48,6 +48,7 @@ from ..model import (
     Undoability,
     UndoResult,
 )
+from ..migrations import CURRENT_VERSION, pending
 from ..ordering import order_verdicts, topological_rank
 from .base import Engine
 
@@ -94,11 +95,18 @@ CREATE TABLE IF NOT EXISTS ctrlz_change_log (
 CREATE INDEX IF NOT EXISTS ctrlz_change_log_op_idx ON ctrlz_change_log (op_id, seq);
 
 CREATE TABLE IF NOT EXISTS ctrlz_current_op (
-    id      INTEGER PRIMARY KEY CHECK (id = 1),
-    op_id   TEXT,
-    label   TEXT,
-    source  TEXT,
-    undo_of TEXT
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    op_id      TEXT,
+    label      TEXT,
+    source     TEXT,
+    undo_of    TEXT,
+    actor_user TEXT,
+    actor_host TEXT,
+    actor_app  TEXT,
+    ticket     TEXT,
+    channel    TEXT,
+    risk       INTEGER,
+    policy_outcome TEXT
 );
 INSERT OR IGNORE INTO ctrlz_current_op (id, op_id) VALUES (1, NULL);
 """
@@ -158,7 +166,48 @@ class SQLiteEngine(Engine):
         return row is not None
 
     def initialize(self) -> None:
+        """Create or upgrade the metadata store.
+
+        SQLite has no ADD COLUMN IF NOT EXISTS, so each column is checked
+        against the catalogue first. Adding a nullable column is a catalogue
+        change here too -- no table rewrite, no long lock.
+        """
+        fresh = not self.is_initialized()
         self.conn.executescript(SCHEMA_SQL)
+
+        for migration in pending(self.schema_version()):
+            for table, column, column_type in migration.sqlite_columns:
+                if not self._has_column(table, column):
+                    self.conn.execute(
+                        f"ALTER TABLE {self._quote(table)} "
+                        f"ADD COLUMN {self._quote(column)} {column_type}"
+                    )
+            for statement in migration.sqlite:
+                self.conn.execute(statement)
+
+        self.conn.execute(
+            "INSERT INTO ctrlz_settings (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (str(CURRENT_VERSION),),
+        )
+
+        # The trigger bodies name the columns they write, so an upgraded
+        # database needs its triggers rebuilt before they can record anything
+        # the migration just added.
+        if not fresh:
+            for table, identity in self.tracked():
+                self.track(table, identity)
+
+    def schema_version(self) -> int:
+        row = self._one("SELECT value FROM ctrlz_settings WHERE key = 'schema_version'")
+        try:
+            return int(row["value"]) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _has_column(self, table: str, column: str) -> bool:
+        rows = self._all(f"PRAGMA table_info({self._quote(table)})")
+        return any(r["name"] == column for r in rows)
 
     def uninstall(self) -> None:
         if not self.is_initialized():
@@ -281,8 +330,12 @@ class SQLiteEngine(Engine):
                      WHERE id = 1 AND op_id IS NULL;
 
                     INSERT OR IGNORE INTO ctrlz_operations
-                        (op_id, label, source, actor, undo_of)
-                    SELECT op_id, label, coalesce(source, 'external'), 'sqlite', undo_of
+                        (op_id, label, source, actor, undo_of,
+                         actor_user, actor_host, actor_app, ticket, channel,
+                         risk, policy_outcome)
+                    SELECT op_id, label, coalesce(source, 'external'), 'sqlite', undo_of,
+                           actor_user, actor_host, actor_app, ticket, channel,
+                           risk, policy_outcome
                       FROM ctrlz_current_op WHERE id = 1;
 
                     UPDATE ctrlz_operations SET row_count = row_count + 1
@@ -334,16 +387,19 @@ class SQLiteEngine(Engine):
         label: Optional[str] = None,
         dry_run: bool = False,
         decide: Optional[Callable[[int], bool]] = None,
+        session: Optional[dict[str, str]] = None,
     ) -> ExecutionResult:
         self._require_init()
         op_id = uuid.uuid4().hex
         warnings: list[str] = []
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            values = _session_columns(session)
             self.conn.execute(
                 "UPDATE ctrlz_current_op SET op_id = ?, label = ?, source = 'ctrlz', "
-                "undo_of = NULL WHERE id = 1",
-                (op_id, label),
+                "undo_of = NULL, actor_user = ?, actor_host = ?, actor_app = ?, "
+                "ticket = ?, channel = ?, risk = ?, policy_outcome = ? WHERE id = 1",
+                (op_id, label, *values),
             )
             rowcount = 0
             for statement in split_statements(sql_text):
@@ -370,10 +426,7 @@ class SQLiteEngine(Engine):
                     warnings.append(
                         "Operation exceeded the capture limit and is NOT undoable."
                     )
-                self.conn.execute(
-                    "UPDATE ctrlz_current_op SET op_id = NULL, label = NULL, "
-                    "source = NULL WHERE id = 1"
-                )
+                self.conn.execute(_CLEAR_CURRENT_OP)
                 self.conn.execute("COMMIT")
                 return ExecutionResult(
                     op_id=op_id if captured is not None else None,
@@ -413,6 +466,13 @@ class SQLiteEngine(Engine):
             undone_at=_parse_ts(r["undone_at"]),
             undone_by=r["undone_by"],
             tables=tables,
+            actor_user=_column(r, "actor_user"),
+            actor_host=_column(r, "actor_host"),
+            actor_app=_column(r, "actor_app"),
+            ticket=_column(r, "ticket"),
+            channel=_column(r, "channel"),
+            risk=_column(r, "risk"),
+            policy_outcome=_column(r, "policy_outcome"),
         )
 
     def operations(
@@ -557,10 +617,7 @@ class SQLiteEngine(Engine):
                 "WHERE op_id = ?",
                 (undo_op, op_id),
             )
-            self.conn.execute(
-                "UPDATE ctrlz_current_op SET op_id = NULL, label = NULL, source = NULL, "
-                "undo_of = NULL WHERE id = 1"
-            )
+            self.conn.execute(_CLEAR_CURRENT_OP)
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -722,6 +779,48 @@ def split_statements(script: str) -> list[str]:
     if tail:
         statements.append(tail)
     return statements or [script]
+
+
+_CLEAR_CURRENT_OP = (
+    "UPDATE ctrlz_current_op SET op_id = NULL, label = NULL, source = NULL, "
+    "undo_of = NULL, actor_user = NULL, actor_host = NULL, actor_app = NULL, "
+    "ticket = NULL, channel = NULL, risk = NULL, policy_outcome = NULL WHERE id = 1"
+)
+
+#: Order matches the UPDATE in execute(); keep the two together.
+_SESSION_KEYS = (
+    "ctrlz.actor_user",
+    "ctrlz.actor_host",
+    "ctrlz.actor_app",
+    "ctrlz.ticket",
+    "ctrlz.channel",
+    "ctrlz.risk",
+    "ctrlz.policy_outcome",
+)
+
+
+def _session_columns(session: Optional[dict[str, str]]) -> tuple:
+    """Flatten the engine-neutral session settings into column values."""
+    session = session or {}
+    values = []
+    for key in _SESSION_KEYS:
+        value = session.get(key)
+        value = None if value in (None, "") else value
+        if key == "ctrlz.risk" and value is not None:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = None
+        values.append(value)
+    return tuple(values)
+
+
+def _column(row, name: str):
+    """Read a column that may not exist yet on a partially upgraded store."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
 
 
 # -- value encoding --------------------------------------------------------

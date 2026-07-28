@@ -48,6 +48,7 @@ from ..model import (
     Undoability,
     UndoResult,
 )
+from ..migrations import CURRENT_VERSION, pending
 from ..ordering import order_verdicts, topological_rank
 from .base import Engine, split_qualified
 
@@ -110,7 +111,11 @@ BEGIN
 EXCEPTION WHEN undefined_function THEN
     RETURN md5(random()::text || clock_timestamp()::text || pg_backend_pid()::text)::uuid;
 END $$;
+"""
 
+# Recreated on every initialize(), after migrations, so the function always
+# matches the columns that actually exist.
+CAPTURE_FUNCTION_SQL = r"""
 CREATE OR REPLACE FUNCTION ctrlz.capture() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER AS $fn$
 DECLARE
@@ -130,14 +135,26 @@ BEGIN
         PERFORM set_config('ctrlz.op_id', v_op_id::text, true);
     END IF;
 
-    INSERT INTO ctrlz.operations (op_id, txid, label, source, actor, undo_of)
+    INSERT INTO ctrlz.operations (
+        op_id, txid, label, source, actor, undo_of,
+        actor_user, actor_host, actor_app, ticket, channel, risk, policy_outcome
+    )
     VALUES (
         v_op_id,
         txid_current(),
         nullif(current_setting('ctrlz.label', true), ''),
         coalesce(nullif(current_setting('ctrlz.source', true), ''), 'external'),
         session_user,
-        nullif(current_setting('ctrlz.undo_of', true), '')::uuid
+        nullif(current_setting('ctrlz.undo_of', true), '')::uuid,
+        -- Attribution. Absent for a change made by a client that never set it;
+        -- NULL is the honest answer there, not a guess.
+        nullif(current_setting('ctrlz.actor_user', true), ''),
+        nullif(current_setting('ctrlz.actor_host', true), ''),
+        nullif(current_setting('ctrlz.actor_app', true), ''),
+        nullif(current_setting('ctrlz.ticket', true), ''),
+        nullif(current_setting('ctrlz.channel', true), ''),
+        nullif(current_setting('ctrlz.risk', true), '')::integer,
+        nullif(current_setting('ctrlz.policy_outcome', true), '')
     )
     ON CONFLICT (op_id) DO NOTHING;
 
@@ -230,8 +247,31 @@ class PostgresEngine(Engine):
         return bool(row)
 
     def initialize(self) -> None:
+        """Create or upgrade the metadata store.
+
+        The whole chain runs every time, fresh installs included, so the
+        upgrade path is exercised constantly rather than only by its own test.
+        """
         with self.conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
+            for migration in pending(self.schema_version()):
+                for statement in migration.postgres:
+                    cur.execute(statement)
+            # Last, so the trigger function always matches the columns that
+            # now exist.
+            cur.execute(CAPTURE_FUNCTION_SQL)
+            cur.execute(
+                "INSERT INTO ctrlz.settings (key, value) VALUES ('schema_version', %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (str(CURRENT_VERSION),),
+            )
+
+    def schema_version(self) -> int:
+        row = self._one("SELECT value FROM ctrlz.settings WHERE key = 'schema_version'")
+        try:
+            return int(row["value"]) if row else 0
+        except (TypeError, ValueError):
+            return 0
 
     def uninstall(self) -> None:
         if not self.is_initialized():
@@ -411,6 +451,7 @@ class PostgresEngine(Engine):
         label: Optional[str] = None,
         dry_run: bool = False,
         decide: Optional[Callable[[int], bool]] = None,
+        session: Optional[dict[str, str]] = None,
     ) -> ExecutionResult:
         self._require_init()
         op_id = str(uuid.uuid4())
@@ -421,6 +462,11 @@ class PostgresEngine(Engine):
                 cur.execute("SELECT set_config('ctrlz.op_id', %s, true)", (op_id,))
                 cur.execute("SELECT set_config('ctrlz.label', %s, true)", (label or "",))
                 cur.execute("SELECT set_config('ctrlz.source', 'ctrlz', true)")
+                # Attribution and the policy verdict, carried into the capture
+                # trigger as transaction-scoped settings. Plain strings only:
+                # the engine layer must not import analysis or policy.
+                for key, value in (session or {}).items():
+                    cur.execute("SELECT set_config(%s, %s, true)", (key, str(value)))
                 cur.execute(sql_text)
                 rowcount = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
                 cur.execute(
@@ -478,6 +524,13 @@ class PostgresEngine(Engine):
             undone_at=r["undone_at"],
             undone_by=str(r["undone_by"]) if r["undone_by"] else None,
             tables=list(r.get("tables") or []),
+            actor_user=r.get("actor_user"),
+            actor_host=r.get("actor_host"),
+            actor_app=r.get("actor_app"),
+            ticket=r.get("ticket"),
+            channel=r.get("channel"),
+            risk=r.get("risk"),
+            policy_outcome=r.get("policy_outcome"),
         )
 
     _OP_SELECT = """

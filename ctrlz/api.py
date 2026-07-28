@@ -18,15 +18,21 @@ import re
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
-from . import preflight
+from .actor import CLI, LIBRARY, Actor
 from .engines.base import Engine
 from .errors import ConfigError, PreflightBlocked
 from .model import ExecutionResult, Operation, Undoability, UndoResult
+from .policy import Context, Decision, PolicyEngine, Policy, load_policy
 
 DEFAULT_CONFIRM_OVER = 100
 
 
-def connect(dsn: Optional[str] = None) -> "Toolkit":
+def connect(
+    dsn: Optional[str] = None,
+    policy: Optional[Policy] = None,
+    actor: Optional[Actor] = None,
+    environment: Optional[str] = None,
+) -> "Toolkit":
     """Open a toolkit against a database URL.
 
     Accepts ``postgresql://...``, ``sqlite:///path.db``, or a bare path to a
@@ -38,7 +44,9 @@ def connect(dsn: Optional[str] = None) -> "Toolkit":
             "no database given -- pass --dsn or set CTRLZ_DSN "
             "(e.g. postgresql://user@host/db or sqlite:///app.db)"
         )
-    return Toolkit(_engine_for(dsn))
+    return Toolkit(
+        _engine_for(dsn), policy=policy, actor=actor, environment=environment
+    )
 
 
 def _engine_for(dsn: str) -> Engine:
@@ -80,8 +88,29 @@ def parse_duration(text: str) -> int:
 class Toolkit:
     """Guardrails and history on top of an engine."""
 
-    def __init__(self, engine: Engine):
+    def __init__(
+        self,
+        engine: Engine,
+        policy: Optional[Policy] = None,
+        actor: Optional[Actor] = None,
+        environment: Optional[str] = None,
+    ):
         self.engine = engine
+        self.policy = policy if policy is not None else load_policy()
+        self.policy_engine = PolicyEngine(self.policy)
+        self.actor = actor or Actor.resolve(channel=LIBRARY)
+        self.environment = environment or os.environ.get("CTRLZ_ENVIRONMENT", "default")
+
+    def check(self, sql: str) -> Decision:
+        """Judge a statement without running it."""
+        return self.policy_engine.evaluate_sql(sql, context=self._context())
+
+    def _context(self) -> Context:
+        return Context.build(
+            tracked=[name for name, _ in self.tracked()],
+            environment=self.environment,
+            actor=self.actor.user,
+        )
 
     # -- context manager ---------------------------------------------------
 
@@ -140,10 +169,9 @@ class Toolkit:
         transaction is still open, so the number it is given is what the
         database actually touched -- not an estimate from a query plan.
         """
-        tracked = {name for name, _ in self.tracked()}
-        checks = preflight.inspect(sql, tracked=tracked)
-        if checks.blocked and not force:
-            raise PreflightBlocked("; ".join(checks.blockers))
+        decision = self.policy_engine.evaluate_sql(sql, context=self._context())
+        if decision.blocked and not force:
+            raise PreflightBlocked("; ".join(decision.blockers) or decision.explain())
 
         threshold = DEFAULT_CONFIRM_OVER if confirm_over is None else confirm_over
 
@@ -152,8 +180,24 @@ class Toolkit:
                 return True
             return confirm(rowcount, sql)
 
-        result = self.engine.execute(sql, label=label, dry_run=dry_run, decide=decide)
-        result.warnings = checks.warnings + result.warnings
+        session = dict(self.actor.as_settings())
+        session["ctrlz.risk"] = str(decision.risk)
+        # A statement that ran despite a block was forced; record that rather
+        # than the verdict we would have given, so the history shows what
+        # actually happened.
+        session["ctrlz.policy_outcome"] = (
+            "forced" if decision.blocked and force else decision.outcome
+        )
+
+        result = self.engine.execute(
+            sql, label=label, dry_run=dry_run, decide=decide, session=session
+        )
+        result.warnings = decision.warnings + result.warnings
+        if decision.blocked and force:
+            result.warnings.insert(
+                0, f"guardrail overridden with --force: {'; '.join(decision.blockers)}"
+            )
+        result.decision = decision
         return result
 
     # -- history -----------------------------------------------------------
@@ -194,8 +238,14 @@ class Toolkit:
             "engine": self.engine.name,
             "initialized": self.engine.is_initialized(),
             "caveats": list(self.engine.caveats),
+            "policy_source": self.policy.source,
+            "policy_rules": len(self.policy.rules),
+            "block_on_risk": self.policy.block_on_risk,
+            "actor": self.actor.describe(),
+            "environment": self.environment,
         }
         if info["initialized"]:
+            info["schema_version"] = getattr(self.engine, "schema_version", lambda: 0)()
             tracked = self.tracked()
             all_tables = self.engine.tables()
             info["tracked"] = tracked
