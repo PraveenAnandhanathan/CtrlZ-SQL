@@ -33,5 +33,8 @@ ctrlz = "ctrlz.cli:main"
 [tool.setuptools.packages.find]
 include = ["ctrlz*"]
 
+[tool.setuptools.package-data]
+ctrlz = ["policy/*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

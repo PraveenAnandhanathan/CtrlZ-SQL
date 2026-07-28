@@ -1,0 +1,106 @@
+# The rulebook ctrlz ships with.
+#
+# Copy this to `ctrlz.policy.yaml` next to your project and edit it. Your file
+# replaces these defaults entirely, so you can always see the whole rulebook in
+# one place rather than guessing what you have inherited.
+#
+# Each rule has:
+#   name     what to call it in messages and overrides
+#   when     the conditions, all of which must hold
+#   action   allow | warn | block
+#   risk     0-100, how alarming this is
+#   message  what the user is told
+#
+# Actions in plain terms:
+#   allow  say nothing
+#   warn   let it run, but say something
+#   block  refuse, unless the user passes --force
+
+version: 1
+
+defaults:
+  # Statements scoring at or above this are called high risk.
+  risk_threshold: 70
+
+  # Whether a high risk score is enough on its own to refuse a statement.
+  # Off by default (decision D-3): a fresh install should never refuse
+  # legitimate work on day one because something merely looked alarming.
+  # Rules with `action: block` still block regardless of this setting.
+  block_on_risk: false
+
+rules:
+  # The classic disaster. An UPDATE or DELETE with nothing to limit it does
+  # not touch "some" rows, it touches all of them.
+  - name: unfiltered-write
+    when:
+      unfiltered: true
+      min_confidence: 0.6
+    action: block
+    risk: 90
+    message: >-
+      {statement} with no WHERE clause on {tables} -- this touches every row in
+      the table.
+
+  # Same shape, but we are not confident enough in the reading to refuse.
+  # Warning on a guess is fair; blocking on one is not.
+  - name: unfiltered-write-unverified
+    when:
+      unfiltered: true
+      max_confidence: 0.59
+    action: warn
+    risk: 70
+    message: >-
+      {statement} on {tables} appears to have no WHERE clause, but the statement
+      could not be parsed confidently. Check it before running.
+
+  # A filter that matches everything is the same disaster wearing a disguise.
+  - name: tautology-filter
+    when:
+      filter_is_tautology: true
+      kind: [write]
+    action: warn
+    risk: 60
+    message: >-
+      the WHERE clause on {tables} matches every row, so this behaves like an
+      unfiltered {statement}.
+
+  # TRUNCATE does not fire row triggers, so ctrlz cannot capture or reverse it.
+  - name: truncate
+    when:
+      statement: [TRUNCATE]
+    action: block
+    risk: 85
+    message: >-
+      TRUNCATE cannot be captured or undone, because it does not fire row
+      triggers. Use DELETE if you want an undoable operation.
+
+  # Schema changes are outside the undo history entirely.
+  - name: destructive-ddl
+    when:
+      statement: [DROP, ALTER]
+    action: warn
+    risk: 70
+    message: >-
+      {statement} on {tables} is a schema change. ctrlz does not capture DDL and
+      cannot undo this -- take a backup first.
+
+  # A write to a table with no capture triggers is a write with no safety net.
+  - name: untracked-table
+    when:
+      writes_untracked: true
+    action: warn
+    risk: 50
+    message: >-
+      {tables} is not tracked, so changes to it cannot be undone. Run
+      `ctrlz track {tables}` first.
+
+  # We could not read the statement well enough to judge it at all.
+  - name: unreadable-write
+    when:
+      kind: [write]
+      max_confidence: 0.4
+    action: warn
+    risk: 30
+    message: >-
+      this statement could not be parsed, so the guardrails checked very little.
+      Capture and undo are unaffected.
