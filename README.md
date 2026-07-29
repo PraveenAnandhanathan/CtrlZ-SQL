@@ -226,8 +226,32 @@ to render it.
 |---|---|
 | **No connection pooling** | one upstream connection per client. Multiplexing sessions would break `SET LOCAL`, temp tables and transactions in ways that are hard to see and impossible to explain |
 | **No credential handling** | authentication is relayed verbatim, which is exactly why `md5` and SCRAM work. The cost: we cannot learn the authenticated identity, so attribution uses the startup packet's `user` and `application_name` |
-| **No TLS from the client** | it must read SQL, so it declines `SSLRequest`. **Bind it to localhost or a trusted segment.** TLS to the upstream is separate and still supported |
+| **No TLS from the client** | it must read SQL, so it declines `SSLRequest`. **Bind it to localhost or a trusted segment** |
+| **Upstream TLS is off by default** | not libpq's default, and deliberately so — see below |
 | **Not required for undo** | capture lives inside the database. Stop the gateway and every change is still recorded and still reversible |
+
+### Upstream TLS and channel binding
+
+`?sslmode=` on the upstream DSN is honoured for the gateway-to-database hop —
+`require`, `verify-ca` and `verify-full` all work, and only `verify-full`
+checks the hostname, exactly as libpq defines them.
+
+It defaults to `disable` rather than libpq's `prefer`, and the reason is worth
+knowing before you change it. If the database hop is encrypted while the client
+hop is not, PostgreSQL offers **SCRAM-SHA-256-PLUS** — channel binding — because
+from its side the connection is protected. The gateway relays that challenge to
+a client on a plaintext socket, and the client correctly refuses:
+
+```
+server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection
+```
+
+That is channel binding working exactly as designed. It exists to stop a
+man-in-the-middle from relaying an authentication exchange, and a proxy that
+reads your SQL *is* a man-in-the-middle. No amount of care on our side changes
+that. The honest options are to leave both hops in the same state (the default),
+or to secure the client hop too — which needs a certificate and is not something
+to half-build. The gateway logs a warning when you enable upstream TLS.
 
 ### It fails open, always
 

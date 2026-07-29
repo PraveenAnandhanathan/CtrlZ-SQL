@@ -31,6 +31,62 @@ from .policy import BLOCK, Context, Decision, Policy, PolicyEngine
 log = logging.getLogger("ctrlz.sdk")
 
 
+class PolicyChecker:
+    """Applies the rulebook to statement text. No connection involved.
+
+    Split out because the SQLAlchemy hook has no DB-API connection to wrap --
+    it sees statements on their way through the engine. The first version
+    constructed a GuardedConnection around ``None``, which worked only for as
+    long as nobody called a connection method on it. This is the same logic
+    with an honest shape.
+    """
+
+    def __init__(
+        self,
+        policy: Optional[Policy] = None,
+        tracked: Iterable[str] = (),
+        environment: str = "default",
+        dialect: str = "postgres",
+        actor: Optional[Actor] = None,
+        on_block: Optional[Callable[[Decision], None]] = None,
+    ):
+        self._engine = PolicyEngine(policy)
+        self._tracked = tuple(tracked)
+        self._environment = environment
+        self._dialect = dialect
+        self._on_block = on_block
+        self.actor = actor or Actor.resolve(channel=SDK)
+        #: Set True to log refusals instead of raising. Off by default: a
+        #: guardrail that only writes to a log is not a guardrail.
+        self.warn_only = False
+
+    def check(self, sql: str) -> Decision:
+        """Evaluate a statement, raising if the rulebook refuses it."""
+        decision = self._engine.evaluate_sql(
+            sql,
+            context=Context.build(
+                tracked=self._tracked,
+                environment=self._environment,
+                actor=self.actor.user,
+            ),
+            dialect=self._dialect,
+        )
+        if decision.outcome != BLOCK:
+            for warning in decision.warnings:
+                log.warning("ctrlz: %s", warning)
+            return decision
+
+        if self._on_block is not None:
+            self._on_block(decision)
+        if self.warn_only:
+            log.warning(
+                "ctrlz would have blocked this: %s", "; ".join(decision.blockers)
+            )
+            return decision
+
+        raise PreflightBlocked("; ".join(decision.blockers) or decision.explain())
+
+
 class GuardedCursor:
     """A DB-API cursor that consults the rulebook before executing."""
 
@@ -80,41 +136,32 @@ class GuardedConnection:
         on_block: Optional[Callable[[Decision], None]] = None,
     ):
         self._connection = connection
-        self._engine = PolicyEngine(policy)
-        self._tracked = tuple(tracked)
-        self._environment = environment
-        self._dialect = dialect
-        self._on_block = on_block
-        self.actor = actor or Actor.resolve(channel=SDK)
-        #: Set True to log refusals instead of raising. Off by default: a
-        #: guardrail that only writes to a log is not a guardrail.
-        self.warn_only = False
+        self._checker = PolicyChecker(
+            policy=policy,
+            tracked=tracked,
+            environment=environment,
+            dialect=dialect,
+            actor=actor,
+            on_block=on_block,
+        )
 
     # -- policy ------------------------------------------------------------
 
+    @property
+    def actor(self) -> Actor:
+        return self._checker.actor
+
+    @property
+    def warn_only(self) -> bool:
+        return self._checker.warn_only
+
+    @warn_only.setter
+    def warn_only(self, value: bool) -> None:
+        self._checker.warn_only = value
+
     def check(self, sql: str) -> Decision:
         """Evaluate a statement, raising if the rulebook refuses it."""
-        decision = self._engine.evaluate_sql(
-            sql,
-            context=Context.build(
-                tracked=self._tracked,
-                environment=self._environment,
-                actor=self.actor.user,
-            ),
-            dialect=self._dialect,
-        )
-        if decision.outcome != BLOCK:
-            for warning in decision.warnings:
-                log.warning("ctrlz: %s", warning)
-            return decision
-
-        if self._on_block is not None:
-            self._on_block(decision)
-        if self.warn_only:
-            log.warning("ctrlz would have blocked this: %s", "; ".join(decision.blockers))
-            return decision
-
-        raise PreflightBlocked("; ".join(decision.blockers) or decision.explain())
+        return self._checker.check(sql)
 
     def attribute(self) -> None:
         """Record who this connection belongs to, for the capture layer.
@@ -184,8 +231,8 @@ def install_sqlalchemy_guard(
     """
     from sqlalchemy import event
 
-    checker = GuardedConnection(
-        None, policy=policy, tracked=tracked, environment=environment, dialect=dialect
+    checker = PolicyChecker(
+        policy=policy, tracked=tracked, environment=environment, dialect=dialect
     )
 
     def before_cursor_execute(

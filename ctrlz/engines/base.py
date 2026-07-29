@@ -9,6 +9,7 @@ lives in engine-independent code.
 from __future__ import annotations
 
 import abc
+from datetime import datetime
 from typing import Any, Iterable, Optional
 
 from ..model import Change, ExecutionResult, Operation, Undoability, UndoResult
@@ -83,6 +84,27 @@ class Engine(abc.ABC):
 
     @abc.abstractmethod
     def changes(self, op_id: str) -> list[Change]: ...
+
+    @abc.abstractmethod
+    def changes_since(self, seq: int, limit: int = 1000) -> list[Change]:
+        """Captured changes with a sequence above ``seq``, oldest first.
+
+        A single indexed range scan. Undo never needs this -- it works one
+        operation at a time -- but anything that follows the log incrementally
+        does, and reconstructing it by walking every operation is quadratic in
+        the size of the history.
+        """
+
+    @abc.abstractmethod
+    def operations_undone_since(
+        self, when: Optional[datetime] = None, limit: int = 1000
+    ) -> list[tuple[str, datetime]]:
+        """Operations undone after ``when``, oldest undo first.
+
+        Undoing sets a column on a row that already exists, so a follower
+        watching the change log's sequence cannot see it. This is the second
+        thing a follower has to ask.
+        """
 
     @abc.abstractmethod
     def assess(self, op_id: str) -> Undoability:

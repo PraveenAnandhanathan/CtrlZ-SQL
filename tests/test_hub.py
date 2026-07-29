@@ -335,3 +335,67 @@ def test_the_hub_works_on_postgres_too(source):
     finally:
         store.close()
         admin.close()
+
+
+# -- scale and catch-up ----------------------------------------------------
+
+
+def test_a_no_op_ship_does_not_get_slower_as_history_grows(source, hub):
+    """The shipper must cost what is *new*, not what has ever happened.
+
+    The first version walked every operation on every run, so a scheduled
+    ship got steadily slower until it was not worth running. This pins the
+    fix: with the source drained, shipping again reads one indexed range and
+    one indexed lookup regardless of how much is behind it.
+    """
+    import time
+
+    def drain():
+        while ship(source, hub, name="billing").moved_anything:
+            pass
+
+    for index in range(40):
+        source.run(f"UPDATE users SET salary = {index + 1} WHERE name = 'ada'")
+    drain()
+    start = time.perf_counter()
+    ship(source, hub, name="billing")
+    small = time.perf_counter() - start
+
+    for index in range(400):
+        source.run(f"UPDATE users SET salary = {index + 100} WHERE name = 'ada'")
+    drain()
+    start = time.perf_counter()
+    ship(source, hub, name="billing")
+    large = time.perf_counter() - start
+
+    # Ten times the history must not mean ten times the work. The allowance is
+    # generous because this is a timing assertion on shared hardware; it is
+    # here to catch a return to linear scanning, not to police milliseconds.
+    assert large < max(small * 5, 0.05), (
+        f"no-op ship grew from {small:.4f}s to {large:.4f}s as history grew 10x"
+    )
+
+
+def test_shipping_catches_up_rather_than_moving_one_batch(source, hub):
+    """A scheduled shipper that moves one batch per run never catches up.
+
+    With a batch of 5 and 30 changes to move, one call must move all 30.
+    """
+    for index in range(30):
+        source.run(f"UPDATE users SET salary = {index + 1} WHERE name = 'ada'")
+
+    result = ship(source, hub, name="billing", batch=5)
+    assert result.changes == 30
+    assert result.batches > 1
+    assert not ship(source, hub, name="billing", batch=5).moved_anything
+
+
+def test_a_bounded_run_stops_where_it_was_told_and_resumes(source, hub):
+    for index in range(30):
+        source.run(f"UPDATE users SET salary = {index + 1} WHERE name = 'ada'")
+
+    first = ship(source, hub, name="billing", batch=5, max_batches=2)
+    assert first.changes == 10
+
+    rest = ship(source, hub, name="billing", batch=5)
+    assert first.changes + rest.changes == 30

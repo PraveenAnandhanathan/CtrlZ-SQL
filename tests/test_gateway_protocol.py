@@ -211,3 +211,57 @@ def test_the_reader_survives_junk(data):
         reader.messages()
     except p.ProtocolError:
         pass  # a refusal is fine; a crash is not
+
+
+# -- upstream TLS ----------------------------------------------------------
+
+
+def test_upstream_tls_is_off_by_default():
+    """Not libpq's default, and deliberately so.
+
+    Encrypting the database hop while the client hop stays plaintext makes
+    PostgreSQL offer SCRAM-SHA-256-PLUS, which the client then refuses --
+    channel binding exists to stop proxies, and the gateway is one.
+    """
+    from ctrlz.gateway import Upstream
+
+    upstream = Upstream.from_dsn("postgresql://user@host:5432/app")
+    assert upstream.sslmode == "disable"
+    assert upstream.wants_tls is False
+    assert upstream.ssl_context() is None
+
+
+@pytest.mark.parametrize(
+    "sslmode,wants,requires,verify",
+    [
+        ("disable", False, False, None),
+        ("allow", False, False, None),
+        ("prefer", True, False, "CERT_NONE"),
+        ("require", True, True, "CERT_NONE"),
+        ("verify-ca", True, True, "CERT_REQUIRED"),
+        ("verify-full", True, True, "CERT_REQUIRED"),
+    ],
+)
+def test_sslmode_is_honoured_the_way_libpq_defines_it(sslmode, wants, requires, verify):
+    from ctrlz.gateway import Upstream
+
+    upstream = Upstream.from_dsn(f"postgresql://h/db?sslmode={sslmode}")
+    assert upstream.wants_tls is wants
+    assert upstream.requires_tls is requires
+
+    context = upstream.ssl_context()
+    if verify is None:
+        assert context is None
+    else:
+        assert context.verify_mode.name == verify
+
+
+def test_only_verify_full_checks_the_hostname():
+    """`require` encrypts without proving who is on the other end.
+
+    That is what libpq does, and saying so is better than implying it is more.
+    """
+    from ctrlz.gateway import Upstream
+
+    assert Upstream.from_dsn("postgresql://h/d?sslmode=require").ssl_context().check_hostname is False
+    assert Upstream.from_dsn("postgresql://h/d?sslmode=verify-full").ssl_context().check_hostname is True

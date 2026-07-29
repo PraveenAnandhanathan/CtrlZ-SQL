@@ -509,20 +509,40 @@ class SQLiteEngine(Engine):
         rows = self._all(
             "SELECT * FROM ctrlz_change_log WHERE op_id = ? ORDER BY seq", (op_id,)
         )
-        return [
-            Change(
-                seq=r["seq"],
-                op_id=r["op_id"],
-                table_schema="",
-                table_name=r["table_name"],
-                action=r["action"],
-                identity=_decode(json.loads(r["identity"])),
-                before=_decode(json.loads(r["before"])) if r["before"] else None,
-                after=_decode(json.loads(r["after"])) if r["after"] else None,
-                captured_at=_parse_ts(r["captured_at"]),
-            )
-            for r in rows
-        ]
+        return [self._row_to_change(r) for r in rows]
+
+    @staticmethod
+    def _row_to_change(r) -> Change:
+        return Change(
+            seq=r["seq"],
+            op_id=r["op_id"],
+            table_schema="",
+            table_name=r["table_name"],
+            action=r["action"],
+            identity=_decode(json.loads(r["identity"])),
+            before=_decode(json.loads(r["before"])) if r["before"] else None,
+            after=_decode(json.loads(r["after"])) if r["after"] else None,
+            captured_at=_parse_ts(r["captured_at"]),
+        )
+
+    def changes_since(self, seq: int, limit: int = 1000) -> list[Change]:
+        self._require_init()
+        rows = self._all(
+            "SELECT * FROM ctrlz_change_log WHERE seq > ? ORDER BY seq LIMIT ?",
+            (seq, limit),
+        )
+        return [self._row_to_change(r) for r in rows]
+
+    def operations_undone_since(self, when=None, limit: int = 1000):
+        self._require_init()
+        marker = when.strftime("%Y-%m-%d %H:%M:%S") if when is not None else None
+        rows = self._all(
+            "SELECT op_id, undone_at FROM ctrlz_operations "
+            " WHERE undone_at IS NOT NULL AND (? IS NULL OR undone_at > ?) "
+            " ORDER BY undone_at LIMIT ?",
+            (marker, marker, limit),
+        )
+        return [(r["op_id"], _parse_ts(r["undone_at"])) for r in rows]
 
     # -- assessment --------------------------------------------------------
 
@@ -654,11 +674,13 @@ class SQLiteEngine(Engine):
         applied = 0
         touched: set[str] = set()
 
+        round_number = 0
         while pending:
             deferred: list[RowVerdict] = []
             progress = False
-            for verdict in pending:
-                savepoint = f"ctrlz_{int(time.time() * 1000) % 100000}_{applied}"
+            round_number += 1
+            for index, verdict in enumerate(pending):
+                savepoint = f"ctrlz_{round_number}_{index}"
                 self.conn.execute(f"SAVEPOINT {self._quote(savepoint)}")
                 try:
                     count = self._apply_inverse(verdict.change, force=verdict.status == DRIFTED)
