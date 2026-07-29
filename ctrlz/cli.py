@@ -9,6 +9,7 @@ import sys
 from typing import Optional
 
 from . import render
+from . import __version__
 from .actor import CLI, Actor
 from .api import DEFAULT_CONFIRM_OVER, Toolkit, connect
 from .errors import CtrlzError, NoIdentity, PreflightBlocked
@@ -31,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
         "defaults to $CTRLZ_DSN",
     )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    # The first line of any useful bug report.
+    parser.add_argument(
+        "--version", action="version", version=f"{PROG} {__version__}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="install the capture machinery")
@@ -187,8 +192,13 @@ def dispatch(toolkit: Toolkit, args) -> int:
 
 def cmd_init(toolkit: Toolkit, args) -> int:
     toolkit.init()
-    _emit(args, {"initialized": True}, lambda: print(
+    target = toolkit.engine.describe_target()
+    # Saying which database was installed into is what turns a wrong --dsn from
+    # a silent success into an obvious one.
+    _emit(args, {"initialized": True, "engine": toolkit.engine.name,
+                 "target": target}, lambda: print(
         render.c("ctrlz installed.", "green")
+        + f"\n  {toolkit.engine.name}  {target}"
         + "\nNext: ctrlz track --all   (or ctrlz track schema.table)"
     ))
     return 0
@@ -680,6 +690,8 @@ def cmd_doctor(toolkit: Toolkit, args) -> int:
         return 0
 
     print(f"engine:      {info['engine']}")
+    if info.get("target"):
+        print(f"target:      {info['target']}")
     print(f"initialized: {'yes' if info['initialized'] else 'no'}")
     print(f"actor:       {info['actor']}  (environment: {info['environment']})")
     print(

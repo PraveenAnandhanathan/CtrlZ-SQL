@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ctrlz-sql"
-version = "0.1.0"
+# Read from ctrlz.__version__, so `ctrlz --version` and the published wheel
+# can never disagree about which release someone is running.
+dynamic = ["version"]
 description = "Undo for SQL: capture row images as changes happen, then reverse them with conflict detection."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,11 +53,16 @@ dev = [
 [project.scripts]
 ctrlz = "ctrlz.cli:main"
 
+[tool.setuptools.dynamic]
+version = { attr = "ctrlz.__version__" }
+
 [tool.setuptools.packages.find]
 include = ["ctrlz*"]
 
 [tool.setuptools.package-data]
-ctrlz = ["policy/*.yaml"]
+# py.typed is what makes the "Typing :: Typed" classifier true: without the
+# marker, PEP 561 says a type checker must ignore the annotations entirely.
+ctrlz = ["policy/*.yaml", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

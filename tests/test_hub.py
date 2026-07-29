@@ -169,10 +169,20 @@ def test_what_changed_is_recorded_even_without_values(source, hub):
 
 def test_the_dsn_hint_never_carries_a_password(tmp_path, hub):
     """The hub says where an operation happened. It is not a credential store."""
+    from ctrlz.engines.base import Engine
     from ctrlz.hub import _dsn_hint
 
     class FakeEngine:
+        """A double, but one that runs the real stripping code.
+
+        Credential stripping lives on the engine now, so that the hub, `init`
+        and `doctor` cannot drift into three implementations of it. The double
+        therefore borrows the real method rather than restating it.
+        """
+
         dsn = "postgresql://someone:hunter2@db.internal:5432/app"
+        path = ""
+        describe_target = Engine.describe_target
 
     hint = _dsn_hint(FakeEngine())
     assert "hunter2" not in hint

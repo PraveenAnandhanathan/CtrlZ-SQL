@@ -368,13 +368,28 @@ neither.
 ## Install
 
 ```bash
-pip install -e ".[postgres]"     # or just: pip install -e .   for SQLite only
-pip install -e ".[mysql]"        # MySQL 8
-pip install -e ".[pg-parser]"    # optional: PostgreSQL's own SQL grammar
+pip install ctrlz-sql                # SQLite, no extra dependencies
+pip install 'ctrlz-sql[postgres]'    # PostgreSQL 12+
+pip install 'ctrlz-sql[mysql]'       # MySQL 8
+pip install 'ctrlz-sql[pg-parser]'   # optional: PostgreSQL's own SQL grammar
 ```
 
 The only required dependencies are `sqlglot` and `PyYAML`, both pure Python.
-Nothing needs a compiler.
+Nothing needs a compiler. `ctrlz --version` reports what you have.
+
+Point it at a database with `--dsn` or `$CTRLZ_DSN`. A URL always wins; a bare
+string is accepted as a SQLite path only when it looks like one — a separator,
+a `.db`/`.sqlite` suffix, `:memory:`, or a file already there. Anything else is
+refused by name rather than turned into a new, empty database:
+
+```
+$ ctrlz --dsn '$PROD_DSN' init      # the variable was never expanded
+ctrlz: '$PROD_DSN' is not a database URL, and does not look like a path to a
+SQLite file, so ctrlz will not create one under that name.
+```
+
+`init` and `doctor` both print the database they actually opened, so a wrong
+`--dsn` shows up immediately instead of looking like a success.
 
 ### Upgrading from 0.1
 
