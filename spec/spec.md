@@ -1,6 +1,6 @@
 # ctrlz — Specification
 
-**Status:** approved — Phase 1 delivered
+**Status:** all four phases delivered
 **Author:** Praveen Anandhanathan
 **Co-author:** Claude
 
@@ -336,6 +336,14 @@ Two invariants that must survive every change in this spec:
 - **Always-on high-throughput production capture.** Capture doubles row writes.
   Documented as a measured trade-off, not switched on blindly.
 - **Database branching / sandboxes.** A different product.
+- **Undo of cascading deletes on MySQL.** InnoDB performs referential actions
+  without firing triggers, so the rows it removes are never captured. ctrlz
+  detects the situation and refuses; it does not attempt to reconstruct what
+  the database did out of sight. Measured and bounded in
+  [`tasks-phase3.md`](./tasks-phase3.md).
+- **Undo orchestrated from the control plane.** The hub is a replica and can be
+  stale; reversing an operation means connecting to the database it happened
+  in.
 - **Making the gateway mandatory.** It is optional by construction (Rule 3).
 
 ---

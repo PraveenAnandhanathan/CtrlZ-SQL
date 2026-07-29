@@ -1,6 +1,6 @@
 # ctrlz — Implementation Plan
 
-**Status:** approved — Phase 1 delivered
+**Status:** all four phases delivered
 **Author:** Praveen Anandhanathan
 **Co-author:** Claude
 **Companion document:** [`spec.md`](./spec.md)
@@ -19,10 +19,14 @@ Four phases. Each ends in a mergeable, independently valuable state.
 
 | Phase | Deliverable | Depends on | Independently useful? |
 |---|---|---|---|
-| **1** | Policy core: real SQL analysis + rule engine + attribution | v0.1 | ✅ better `ctrlz check` / `ctrlz run` |
-| **2** | Gateway: PostgreSQL wire proxy enforcing policy | Phase 1 | ✅ protects every client |
-| **3** | MySQL engine | v0.1 | ✅ third database supported |
-| **4** | Control plane: team history | Phases 1–3 | ✅ cross-database audit |
+| **1** | Policy core: real SQL analysis + rule engine + attribution | v0.1 | ✅ **merged** (PR #1) |
+| **2** | Gateway: PostgreSQL wire proxy + SDK wrapper | Phase 1 | ✅ **merged** (PR #2) |
+| **3** | MySQL engine | v0.1 | ✅ **merged** (PR #3) — see [`tasks-phase3.md`](./tasks-phase3.md) |
+| **4** | Control plane: team history | Phases 1–3 | ✅ **merged** (PR #4) |
+
+**All four phases are delivered.** 556 tests pass across SQLite, PostgreSQL 16
+and MySQL 8, with five strict xfails recording the one thing MySQL genuinely
+cannot do.
 
 **Decided at review: the first pull request is Phase 1 only.** A tighter,
 reviewable change. Phase 2 follows as its own PR.
