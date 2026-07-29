@@ -25,7 +25,8 @@ Undone. 284 row(s) restored across public.customers.
   This undo is itself operation 4f10c8a1 -- run `ctrlz redo` to reverse it.
 ```
 
-Works on **PostgreSQL** and **SQLite**.
+Works on **PostgreSQL** and **SQLite**, from the command line, from Python, or
+through a gateway that protects every client you already use.
 
 ---
 
@@ -190,6 +191,87 @@ Conditions are flat named fields — `statement`, `kind`, `unfiltered`,
 `min_confidence`, `max_confidence` — deliberately not an expression language. A
 rulebook that needs its own parser cannot be read at a glance.
 
+## The gateway
+
+> Point your existing tools at a checkpoint instead of at the database. Nothing
+> about them changes.
+
+```console
+$ ctrlz gateway --listen 127.0.0.1:6543 --upstream postgresql://localhost/app
+ctrlz gateway listening on 127.0.0.1:6543 -> localhost:5432
+  4 tracked table(s); 7 rule(s) from ctrlz.policy.yaml
+```
+
+Then connect anything — `psql`, DBeaver, a BI tool, an application — to
+`127.0.0.1:6543` instead of the database:
+
+```console
+$ psql -h 127.0.0.1 -p 6543 -U app -d app
+app=> DELETE FROM orders;
+ERROR:  ctrlz: DELETE with no WHERE clause on orders -- this touches every row
+DETAIL:  Blocked by rule 'unfiltered-write' (risk 90/70). Read by sqlglot,
+         confidence 0.90.
+HINT:  Run it through `ctrlz run --force` if you are sure, or adjust the rule
+       in ctrlz.policy.yaml.
+app=> SELECT count(*) FROM orders;   -- session still fine
+```
+
+That is a real `psql` with no plugin, no wrapper and no configuration: the
+refusal is a protocol-native `ErrorResponse`, so every client already knows how
+to render it.
+
+### What it deliberately does not do
+
+| | Why |
+|---|---|
+| **No connection pooling** | one upstream connection per client. Multiplexing sessions would break `SET LOCAL`, temp tables and transactions in ways that are hard to see and impossible to explain |
+| **No credential handling** | authentication is relayed verbatim, which is exactly why `md5` and SCRAM work. The cost: we cannot learn the authenticated identity, so attribution uses the startup packet's `user` and `application_name` |
+| **No TLS from the client** | it must read SQL, so it declines `SSLRequest`. **Bind it to localhost or a trusted segment.** TLS to the upstream is separate and still supported |
+| **Not required for undo** | capture lives inside the database. Stop the gateway and every change is still recorded and still reversible |
+
+### It fails open, always
+
+Any internal exception logs and forwards the statement unchanged. A bug in the
+checkpoint must never be able to take the database offline — and it never needs
+to, because the recorder inside the database is running either way. A statement
+we failed to judge is still a statement we can undo. There is a fault-injection
+test that forces evaluation to raise on every statement and asserts the client
+still completes its work.
+
+Measured overhead per statement: **0.26 ms** first sight, **0.0015 ms** for a
+statement already seen (verdicts are memoised because analysis is pure), against
+a 1 ms budget.
+
+## For applications that cannot be re-pointed
+
+Some deployments bake the DSN in, or the traffic never leaves the process. Those
+get a wrapper rather than a proxy:
+
+```python
+import psycopg2
+from ctrlz.sdk import guard
+
+conn = guard(psycopg2.connect(DSN), tracked=["public.users"])
+conn.cursor().execute("DELETE FROM users")   # raises PreflightBlocked
+```
+
+SQLAlchemy has a hook:
+
+```python
+from ctrlz.sdk import install_sqlalchemy_guard
+
+remove = install_sqlalchemy_guard(engine, tracked=["public.users"])
+```
+
+The wrapper is a proxy, not a reimplementation — anything it does not define is
+delegated to the real connection, so driver-specific features keep working.
+
+**Both doors call the same evaluator.** A test runs the same statements through
+the gateway, the SDK and the CLI and fails if any of them disagrees. A rule that
+holds at one door and not another is worse than no rule, because the same
+statement is refused or permitted depending on how the application happened to
+connect, and nothing makes that visible.
+
 ## Attribution
 
 Every operation records who made it:
@@ -280,6 +362,7 @@ Known limits
 | `ctrlz redo` | reverse the last undo |
 | `ctrlz check "<sql>"` | run the guardrails without executing (exit 0/1/2) |
 | `ctrlz purge --older-than 24h` | trim history |
+| `ctrlz gateway` | run the checkpoint in front of the database |
 | `ctrlz doctor` | what is protected, what is not, and what cannot be promised |
 
 Operations can be named by id prefix (`ctrlz undo 97e9ce62`) or by `last`.
@@ -354,8 +437,15 @@ Beyond that:
   the analysis or policy packages;
 - a **migration test** that upgrades a genuine v0.1 database and undoes history
   captured before the upgrade;
+- **gateway tests driven by real clients** — `psql` as a subprocess for the
+  simple protocol, psycopg3 for the extended one — because a desynchronised
+  session or a swallowed authentication challenge is invisible to anything that
+  speaks a simplified dialect;
+- a **fault-injection test** proving the gateway fails open;
+- an **agreement test** asserting the gateway, the SDK and the CLI reach
+  identical verdicts;
 - **benchmarks** asserting the analysis budget (measured: 0.25 ms median,
-  0.46 ms p99 for parse plus policy evaluation).
+  0.46 ms p99 for parse plus policy; 0.0015 ms for a repeated statement).
 
 ## License
 
