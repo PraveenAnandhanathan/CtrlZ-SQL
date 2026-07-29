@@ -18,7 +18,9 @@ What it deliberately does not do:
   and ``application_name``.
 * **It does not terminate TLS from the client.** It must read SQL, so it
   answers ``SSLRequest`` with a decline and proceeds in plaintext. Bind it to
-  localhost or a trusted segment.
+  localhost or a trusted segment. The *upstream* hop is separate and does
+  honour ``sslmode`` in the upstream DSN, including certificate verification
+  under ``verify-full``.
 * **It is not required for undo.** Capture lives inside the database. Stop the
   gateway and every change is still recorded and still reversible.
 """
@@ -27,10 +29,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 import struct
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..actor import GATEWAY, Actor
 from ..policy import Policy
@@ -49,18 +52,66 @@ class Upstream:
 
     host: str = "127.0.0.1"
     port: int = 5432
-    #: Overrides the database the client asked for, when set.
+    #: The database named in the DSN, for logging. The client's own startup
+    #: packet decides which database it gets; the gateway does not rewrite it.
     database: Optional[str] = None
+    #: libpq's sslmode for the gateway-to-database hop. Defaults to
+    #: ``disable``, which is *not* libpq's default, and the reason is
+    #: important enough to state here rather than bury.
+    #:
+    #: If the upstream hop is encrypted and the client hop is not, PostgreSQL
+    #: offers SCRAM-SHA-256-PLUS -- channel binding -- because from its side
+    #: the connection is protected. The gateway relays that challenge verbatim
+    #: to a client on a plaintext socket, and the client correctly refuses:
+    #: "server offered SCRAM-SHA-256-PLUS authentication over a non-SSL
+    #: connection".
+    #:
+    #: That is channel binding working as designed. It exists to stop exactly
+    #: the thing a proxy does, and no amount of care on our side changes it.
+    #: The only honest resolutions are to leave both hops in the same state
+    #: (the default) or to secure the client hop too, which needs a
+    #: certificate and is not something to half-build.
+    #:
+    #: Set ``?sslmode=require`` on the upstream DSN when the database demands
+    #: encryption and does not use channel binding; the gateway warns.
+    sslmode: str = "disable"
 
     @classmethod
     def from_dsn(cls, dsn: str) -> "Upstream":
         parsed = urlparse(dsn)
         database = unquote(parsed.path.lstrip("/")) or None
+        options = parse_qs(parsed.query or "")
         return cls(
             host=parsed.hostname or "127.0.0.1",
             port=parsed.port or 5432,
             database=database,
+            sslmode=(options.get("sslmode") or ["disable"])[0].lower(),
         )
+
+    @property
+    def wants_tls(self) -> bool:
+        return self.sslmode not in ("disable", "allow")
+
+    @property
+    def requires_tls(self) -> bool:
+        """Whether a refusal to encrypt should end the connection."""
+        return self.sslmode in ("require", "verify-ca", "verify-full")
+
+    def ssl_context(self) -> Optional["ssl.SSLContext"]:
+        """A context matching the requested sslmode.
+
+        ``verify-full`` and ``verify-ca`` verify the chain; ``require`` and
+        ``prefer`` encrypt without verifying, which is what libpq does and is
+        stated plainly rather than presented as security it is not.
+        """
+        if not self.wants_tls:
+            return None
+        context = ssl.create_default_context()
+        if self.sslmode != "verify-full":
+            context.check_hostname = False
+        if self.sslmode not in ("verify-ca", "verify-full"):
+            context.verify_mode = ssl.CERT_NONE
+        return context
 
 
 @dataclass
@@ -101,6 +152,14 @@ class Gateway:
             "ctrlz gateway listening on %s:%s -> %s:%s",
             host, bound, self.upstream.host, self.upstream.port,
         )
+        if self.upstream.wants_tls:
+            log.warning(
+                "upstream sslmode=%s encrypts the database hop while the client "
+                "hop stays plaintext. If the server offers SCRAM-SHA-256-PLUS, "
+                "clients will refuse to authenticate -- channel binding is meant "
+                "to stop proxies, and this is one.",
+                self.upstream.sslmode,
+            )
         return bound
 
     async def serve_forever(self) -> None:
@@ -149,9 +208,7 @@ class Gateway:
             if startup is None:
                 return
 
-            server_reader, server_writer = await asyncio.open_connection(
-                self.upstream.host, self.upstream.port
-            )
+            server_reader, server_writer = await self._connect_upstream()
 
             if startup.is_cancel_request:
                 # Cancellation arrives on its own connection and gets no reply.
@@ -194,6 +251,51 @@ class Gateway:
         finally:
             _close(client_writer)
             _close(server_writer)
+
+    async def _connect_upstream(self):
+        """Open the upstream connection, negotiating TLS if asked for.
+
+        PostgreSQL does not accept TLS on connect: the client sends an
+        SSLRequest in the clear and the server answers with a single byte,
+        after which the socket is upgraded. So the handshake has to be driven
+        here rather than handed to ``open_connection(ssl=...)``.
+        """
+        reader, writer = await asyncio.open_connection(
+            self.upstream.host, self.upstream.port
+        )
+        context = self.upstream.ssl_context()
+        if context is None:
+            return reader, writer
+
+        writer.write(struct.pack("!II", 8, protocol.SSL_REQUEST))
+        await writer.drain()
+        answer = await reader.readexactly(1)
+
+        if answer != b"S":
+            if self.upstream.requires_tls:
+                _close(writer)
+                raise protocol.ProtocolError(
+                    f"upstream refused TLS but sslmode={self.upstream.sslmode} "
+                    f"requires it"
+                )
+            log.info("upstream declined TLS; continuing in plaintext")
+            return reader, writer
+
+        transport = writer.transport
+        protocol_obj = transport.get_protocol()
+        loop = asyncio.get_running_loop()
+        new_transport = await loop.start_tls(
+            transport,
+            protocol_obj,
+            context,
+            server_hostname=self.upstream.host
+            if self.upstream.sslmode == "verify-full"
+            else None,
+        )
+        protocol_obj._stream_reader._transport = new_transport
+        writer._transport = new_transport
+        log.info("upstream connection encrypted (sslmode=%s)", self.upstream.sslmode)
+        return reader, writer
 
     # -- startup -----------------------------------------------------------
 

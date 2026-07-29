@@ -90,7 +90,18 @@ def parse_duration(text: str) -> int:
 
 
 class Toolkit:
-    """Guardrails and history on top of an engine."""
+    """Guardrails and history on top of an engine.
+
+    **Not thread-safe.** A Toolkit holds one database connection, and the
+    drivers underneath it (psycopg2, sqlite3, PyMySQL) do not support
+    concurrent use of a single connection. Give each thread its own
+    ``connect()``; they are cheap, and sharing one would corrupt the protocol
+    state rather than merely serialise.
+
+    The gateway is unaffected -- it opens a connection per client and never
+    uses a Toolkit -- and so is the SDK wrapper, which guards whatever
+    connection the application already had.
+    """
 
     def __init__(
         self,

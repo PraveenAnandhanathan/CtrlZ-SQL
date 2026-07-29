@@ -219,6 +219,8 @@ def test_doctor_reports_policy_schema_and_gaps(capsys, db_url):
     run(capsys, "--dsn", db_url, "untrack", "users")
     code, out, _ = run(capsys, "--dsn", db_url, "doctor")
     assert code == 0
-    assert "schema:      v2" in out
+    from ctrlz.migrations import CURRENT_VERSION
+
+    assert f"schema:      v{CURRENT_VERSION}" in out
     assert "NOT protected" in out
     assert "block on risk: no" in out

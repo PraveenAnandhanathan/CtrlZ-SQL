@@ -235,6 +235,13 @@ class MySQLEngine(Engine):
                         f"ADD COLUMN {self._quote(column)} "
                         f"{'int' if column_type == 'INTEGER' else 'text'}"
                     )
+            for statement in migration.mysql:
+                # MySQL has no CREATE INDEX IF NOT EXISTS, so the catalogue is
+                # checked instead of relying on an error being harmless.
+                name = _index_name(statement)
+                if name and self._has_index(name):
+                    continue
+                self._exec(statement)
 
         self._exec(
             "INSERT INTO ctrlz_settings (`key`, `value`) VALUES ('schema_version', %s) "
@@ -259,6 +266,15 @@ class MySQLEngine(Engine):
             return int(row["value"]) if row else 0
         except (TypeError, ValueError, KeyError):
             return 0
+
+    def _has_index(self, name: str) -> bool:
+        return bool(
+            self._one(
+                "SELECT 1 AS ok FROM information_schema.statistics "
+                " WHERE table_schema = %s AND index_name = %s LIMIT 1",
+                (self.database, name),
+            )
+        )
 
     def _has_column(self, table: str, column: str) -> bool:
         return bool(
@@ -642,20 +658,39 @@ class MySQLEngine(Engine):
         rows = self._all(
             "SELECT * FROM ctrlz_change_log WHERE op_id = %s ORDER BY seq", (op_id,)
         )
-        return [
-            Change(
-                seq=r["seq"],
-                op_id=r["op_id"],
-                table_schema="",
-                table_name=r["table_name"],
-                action=r["action"],
-                identity=_decode(r["identity"]),
-                before=_decode(r["before"]),
-                after=_decode(r["after"]),
-                captured_at=_as_datetime(r["captured_at"]),
-            )
-            for r in rows
-        ]
+        return [self._row_to_change(r) for r in rows]
+
+    @staticmethod
+    def _row_to_change(r) -> Change:
+        return Change(
+            seq=r["seq"],
+            op_id=r["op_id"],
+            table_schema="",
+            table_name=r["table_name"],
+            action=r["action"],
+            identity=_decode(r["identity"]),
+            before=_decode(r["before"]),
+            after=_decode(r["after"]),
+            captured_at=_as_datetime(r["captured_at"]),
+        )
+
+    def changes_since(self, seq: int, limit: int = 1000) -> list[Change]:
+        self._require_init()
+        rows = self._all(
+            "SELECT * FROM ctrlz_change_log WHERE seq > %s ORDER BY seq LIMIT %s",
+            (seq, limit),
+        )
+        return [self._row_to_change(r) for r in rows]
+
+    def operations_undone_since(self, when=None, limit: int = 1000):
+        self._require_init()
+        rows = self._all(
+            "SELECT op_id, undone_at FROM ctrlz_operations "
+            " WHERE undone_at IS NOT NULL AND (%s IS NULL OR undone_at > %s) "
+            " ORDER BY undone_at LIMIT %s",
+            (when, when, limit),
+        )
+        return [(r["op_id"], _as_datetime(r["undone_at"])) for r in rows]
 
     # -- assessment --------------------------------------------------------
 
@@ -999,6 +1034,11 @@ class MySQLEngine(Engine):
 
 
 # -- value encoding --------------------------------------------------------
+
+
+def _index_name(statement: str) -> Optional[str]:
+    parts = statement.split()
+    return parts[2] if len(parts) > 2 and parts[0].upper() == "CREATE" else None
 
 
 def _decode(raw: Any) -> Any:

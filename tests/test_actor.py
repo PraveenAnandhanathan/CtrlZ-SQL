@@ -164,5 +164,7 @@ def test_doctor_reports_policy_and_actor(db):
     info = db.doctor()
     assert info["policy_rules"] > 0
     assert info["block_on_risk"] is False
-    assert info["schema_version"] == 2
+    from ctrlz.migrations import CURRENT_VERSION
+
+    assert info["schema_version"] == CURRENT_VERSION
     assert "@" in info["actor"]

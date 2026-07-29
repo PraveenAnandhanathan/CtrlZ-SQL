@@ -25,8 +25,17 @@ PG_DSN_ENV = "CTRLZ_TEST_PG_DSN"
 
 
 def test_pending_returns_only_newer_migrations():
-    assert [m.version for m in pending(0)] == [2]
-    assert [m.version for m in pending(1)] == [2]
+    """Asserted against the migration list rather than a hard-coded version,
+    so adding a migration does not require editing this test."""
+    from ctrlz.migrations import MIGRATIONS
+
+    every_version = [m.version for m in MIGRATIONS]
+    assert every_version == sorted(every_version), "migrations must be ordered"
+    assert len(set(every_version)) == len(every_version), "versions must be unique"
+    assert max(every_version) == CURRENT_VERSION
+
+    assert [m.version for m in pending(0)] == every_version
+    assert [m.version for m in pending(1)] == [v for v in every_version if v > 1]
     assert pending(CURRENT_VERSION) == ()
 
 

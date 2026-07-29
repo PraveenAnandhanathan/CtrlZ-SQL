@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 #: The schema this version of ctrlz expects.
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,7 @@ class Migration:
     #: Statements per engine. Missing engines are a no-op for that migration.
     postgres: tuple[str, ...] = ()
     sqlite: tuple[str, ...] = ()
+    mysql: tuple[str, ...] = ()
     #: Columns to add to a table, checked before adding on engines without
     #: ADD COLUMN IF NOT EXISTS.
     sqlite_columns: tuple[tuple[str, str, str], ...] = ()
@@ -49,6 +50,8 @@ _ATTRIBUTION_COLUMNS = (
     ("risk", "integer", "INTEGER"),
     ("policy_outcome", "text", "TEXT"),
 )
+
+_UNDONE_INDEX = "ctrlz_operations_undone_idx"
 
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
@@ -69,6 +72,23 @@ MIGRATIONS: tuple[Migration, ...] = (
             # only the destination leaves capture unable to write at all.
             for table in ("ctrlz_operations", "ctrlz_current_op")
             for name, _, sqlite_type in _ATTRIBUTION_COLUMNS
+        ),
+    ),
+    Migration(
+        version=3,
+        description="index undone_at so a follower can find undos in one query",
+        # Anything replicating the history has to ask "what was undone since
+        # I last looked", and that question is a table scan without this.
+        postgres=(
+            f"CREATE INDEX IF NOT EXISTS {_UNDONE_INDEX} "
+            f"ON ctrlz.operations (undone_at) WHERE undone_at IS NOT NULL",
+        ),
+        sqlite=(
+            f"CREATE INDEX IF NOT EXISTS {_UNDONE_INDEX} "
+            f"ON ctrlz_operations (undone_at)",
+        ),
+        mysql=(
+            f"CREATE INDEX {_UNDONE_INDEX} ON ctrlz_operations (undone_at)",
         ),
     ),
 )

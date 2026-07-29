@@ -568,20 +568,41 @@ class PostgresEngine(Engine):
         rows = self._all(
             "SELECT * FROM ctrlz.change_log WHERE op_id = %s ORDER BY seq", (op_id,)
         )
-        return [
-            Change(
-                seq=r["seq"],
-                op_id=str(r["op_id"]),
-                table_schema=r["table_schema"],
-                table_name=r["table_name"],
-                action=r["action"],
-                identity=r["identity"],
-                before=r["before"],
-                after=r["after"],
-                captured_at=r["captured_at"],
-            )
-            for r in rows
-        ]
+        return [self._row_to_change(r) for r in rows]
+
+    @staticmethod
+    def _row_to_change(r) -> Change:
+        return Change(
+            seq=r["seq"],
+            op_id=str(r["op_id"]),
+            table_schema=r["table_schema"],
+            table_name=r["table_name"],
+            action=r["action"],
+            identity=r["identity"],
+            before=r["before"],
+            after=r["after"],
+            captured_at=r["captured_at"],
+        )
+
+    def changes_since(self, seq: int, limit: int = 1000) -> list[Change]:
+        self._require_init()
+        rows = self._all(
+            "SELECT * FROM ctrlz.change_log WHERE seq > %s ORDER BY seq LIMIT %s",
+            (seq, limit),
+        )
+        return [self._row_to_change(r) for r in rows]
+
+    def operations_undone_since(
+        self, when=None, limit: int = 1000
+    ) -> list[tuple[str, Any]]:
+        self._require_init()
+        rows = self._all(
+            "SELECT op_id, undone_at FROM ctrlz.operations "
+            " WHERE undone_at IS NOT NULL AND (%s::timestamptz IS NULL OR undone_at > %s) "
+            " ORDER BY undone_at LIMIT %s",
+            (when, when, limit),
+        )
+        return [(str(r["op_id"]), r["undone_at"]) for r in rows]
 
     # -- assessment --------------------------------------------------------
 
