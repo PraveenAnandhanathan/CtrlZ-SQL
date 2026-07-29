@@ -25,8 +25,8 @@ Undone. 284 row(s) restored across public.customers.
   This undo is itself operation 4f10c8a1 -- run `ctrlz redo` to reverse it.
 ```
 
-Works on **PostgreSQL** and **SQLite**, from the command line, from Python, or
-through a gateway that protects every client you already use.
+Works on **PostgreSQL**, **MySQL** and **SQLite**, from the command line, from
+Python, or through a gateway that protects every client you already use.
 
 ---
 
@@ -303,6 +303,7 @@ neither.
 
 ```bash
 pip install -e ".[postgres]"     # or just: pip install -e .   for SQLite only
+pip install -e ".[mysql]"        # MySQL 8
 pip install -e ".[pg-parser]"    # optional: PostgreSQL's own SQL grammar
 ```
 
@@ -400,6 +401,14 @@ than useless:
   as a feature. `ctrlz` warns and stays out of the way.
 - **`TRUNCATE` cannot be captured** — it does not fire row triggers. The
   guardrail blocks it and suggests `DELETE` instead.
+- **Cascading deletes on MySQL cannot be undone.** InnoDB performs
+  `ON DELETE CASCADE` below the trigger layer, so the rows it removes are never
+  captured — measured: the child's trigger fires *zero* times, where PostgreSQL
+  fires it once. ctrlz detects this and reports such operations as **not
+  undoable** rather than restoring the parent and silently losing the children.
+  `ctrlz doctor` names the affected tables. Everything outside a cascade is
+  unaffected, and the boundary is asserted by tests — see
+  [`spec/tasks-phase3.md`](spec/tasks-phase3.md).
 - **Tables need a stable row identity**: a primary key, a `NOT NULL` unique
   index, or (on SQLite) a rowid. Otherwise pass `--identity col1,col2`.
 - **Capture costs writes.** Every changed row writes a second row. This is a
@@ -416,9 +425,17 @@ than useless:
 
 ```bash
 pip install -e ".[dev]"
-pytest                                              # SQLite only
-CTRLZ_TEST_PG_DSN=postgresql://user@localhost/db pytest   # both engines
+pytest                                                     # SQLite only
+CTRLZ_TEST_PG_DSN=postgresql://user@localhost/db \
+CTRLZ_TEST_MYSQL_DSN=mysql://user:pw@localhost/db pytest   # all three engines
 ```
+
+The same behavioural tests run against every available engine, with the test
+bodies identical. Where an engine genuinely cannot do something — MySQL and
+cascading deletes — it is recorded as a strict `xfail` in one labelled list in
+`conftest.py`, never by weakening an assertion. Strict, so that if MySQL ever
+starts passing them the build fails and somebody has to come back and remove
+the entry.
 
 The suite runs the same behavioural tests against every available engine, and
 covers the cases that make this hard rather than only the happy path: cascading
