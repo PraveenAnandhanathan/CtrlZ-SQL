@@ -1,6 +1,6 @@
 # ctrlz — Implementation Plan
 
-**Status:** draft, awaiting review
+**Status:** approved — Phase 1 delivered
 **Author:** Praveen Anandhanathan
 **Co-author:** Claude
 **Companion document:** [`spec.md`](./spec.md)

@@ -1,6 +1,6 @@
 # ctrlz — Phase 1 Task Breakdown
 
-**Status:** draft, awaiting approval
+**Status:** complete — all 22 tasks delivered across 5 commits
 **Scope:** Phase 1 only (policy core) — decision D-1
 **Author:** Praveen Anandhanathan
 **Co-author:** Claude
@@ -310,17 +310,29 @@ explaining in the PR.
 
 ## Definition of done
 
-- [ ] T1–T22 complete
-- [ ] Existing 63 tests pass unmodified; new tests pass on PostgreSQL + SQLite
-- [ ] Rules load from YAML; a rule change alters behaviour with no code change
-- [ ] Unparseable SQL degrades to regex with lowered confidence, never raises
-- [ ] A v0.1 database upgrades cleanly and stays undoable throughout
-- [ ] `ctrlz log` shows actor and risk
-- [ ] `ctrlz/engines/` imports neither `analysis` nor `policy` (enforced by T19)
-- [ ] p99 `analyze()` < 1 ms
-- [ ] `README.md` updated
-- [ ] Five commits, authored by Praveen Anandhanathan, co-authored by Claude
-- [ ] PR raised and merged
+- [x] T1–T22 complete
+- [x] Existing 63 tests pass unmodified (verified by `git diff` against v0.1);
+      412 tests pass on PostgreSQL + SQLite
+- [x] Rules load from YAML; a rule change alters behaviour with no code change
+- [x] Unparseable SQL degrades to regex with lowered confidence, never raises
+- [x] A v0.1 database upgrades cleanly and stays undoable throughout
+- [x] `ctrlz log` shows actor and risk
+- [x] `ctrlz/engines/` imports neither `analysis` nor `policy` (enforced by T19)
+- [x] p99 `analyze()` < 1 ms — **measured 0.46 ms** for parse plus policy
+- [x] `README.md` updated
+- [x] Five commits, authored by Praveen Anandhanathan, co-authored by Claude
+- [x] PR raised and merged
+
+## Defects found by the tests, not after them
+
+The four artefacts that earned their cost:
+
+| Found by | Defect |
+|---|---|
+| differential corpus (T6) | pglast missed `WHERE true` as a tautology and could not extract `DROP` targets; the regex backend was fooled by a leading CTE and by `WHERE` nested in parentheses |
+| corpus, second pass | the blanked-identifier placeholder was the literal string `ident`, which could match a table genuinely named `ident` — wrong information, not merely less |
+| migration test (T13) | on SQLite the attribution is staged in `ctrlz_current_op` before triggers copy it across; migrating only the destination left capture unable to write at all |
+| the original 63 tests | pinning the `preflight` shim to the regex backend silently downgraded unfiltered writes from block to warn |
 
 ---
 

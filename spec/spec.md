@@ -1,6 +1,6 @@
 # ctrlz — Specification
 
-**Status:** draft, awaiting review
+**Status:** approved — Phase 1 delivered
 **Author:** Praveen Anandhanathan
 **Co-author:** Claude
 
