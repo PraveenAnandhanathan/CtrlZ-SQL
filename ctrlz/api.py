@@ -35,8 +35,8 @@ def connect(
 ) -> "Toolkit":
     """Open a toolkit against a database URL.
 
-    Accepts ``postgresql://...``, ``sqlite:///path.db``, or a bare path to a
-    SQLite file. Falls back to ``$CTRLZ_DSN``.
+    Accepts ``postgresql://...``, ``mysql://...``, ``sqlite:///path.db``, or a
+    bare path to a SQLite file. Falls back to ``$CTRLZ_DSN``.
     """
     dsn = dsn or os.environ.get("CTRLZ_DSN")
     if not dsn:
@@ -55,6 +55,10 @@ def _engine_for(dsn: str) -> Engine:
         from .engines.postgres import PostgresEngine
 
         return PostgresEngine(dsn)
+    if scheme in ("mysql", "mariadb"):
+        from .engines.mysql import MySQLEngine
+
+        return MySQLEngine(dsn)
     if scheme == "sqlite":
         # sqlite:///relative.db and sqlite:////absolute/path.db, per the usual
         # convention: exactly one slash belongs to the authority separator.
@@ -246,6 +250,14 @@ class Toolkit:
         }
         if info["initialized"]:
             info["schema_version"] = getattr(self.engine, "schema_version", lambda: 0)()
+            risks = getattr(self.engine, "cascade_risks", None)
+            if risks is not None:
+                tracked_names = {n.lower() for n, _ in self.tracked()}
+                info["cascade_risks"] = {
+                    parent: sorted({e["child"] for e in entries})
+                    for parent, entries in risks().items()
+                    if parent in tracked_names
+                }
             tracked = self.tracked()
             all_tables = self.engine.tables()
             info["tracked"] = tracked

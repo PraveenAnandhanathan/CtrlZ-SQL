@@ -545,6 +545,17 @@ def cmd_doctor(toolkit: Toolkit, args) -> int:
         for name in untracked:
             print(f"  {name}")
         print(render.c("  Changes to these tables cannot be undone.", "dim"))
+    cascade_risks = info.get("cascade_risks") or {}
+    if cascade_risks:
+        print(f"\n{render.c('Cascade blind spot', 'red')} ({len(cascade_risks)} table(s))")
+        for parent, children in sorted(cascade_risks.items()):
+            print(f"  {parent}  ->  {', '.join(children)}")
+        print(render.c(
+            "  This database performs foreign-key cascades without firing triggers, "
+            "so rows\n  removed from those children are never captured. Deletes from "
+            "these tables are\n  reported as NOT undoable rather than partially "
+            "restored.", "dim"))
+
     if info["caveats"]:
         print(f"\n{render.c('Known limits', 'dim')}")
         for caveat in info["caveats"]:

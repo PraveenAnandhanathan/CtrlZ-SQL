@@ -193,10 +193,15 @@ class SQLiteEngine(Engine):
 
         # The trigger bodies name the columns they write, so an upgraded
         # database needs its triggers rebuilt before they can record anything
-        # the migration just added.
+        # the migration just added. A table tracked earlier may have been
+        # dropped since; that is a stale bookkeeping row, not a reason to
+        # refuse the upgrade.
         if not fresh:
             for table, identity in self.tracked():
-                self.track(table, identity)
+                try:
+                    self.track(table, identity)
+                except (NotTracked, NoIdentity):
+                    self.untrack(table)
 
     def schema_version(self) -> int:
         row = self._one("SELECT value FROM ctrlz_settings WHERE key = 'schema_version'")
