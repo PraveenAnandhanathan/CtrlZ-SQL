@@ -14,6 +14,7 @@ never the recorder.
 from .interceptor import FORWARD, REFUSE, Interceptor, Verdict
 from .protocol import Message, MessageReader, ProtocolError, StartupPacket
 from .server import Gateway, Upstream, run_gateway
+from .tls import ServerTLS, TLSConfigError
 
 __all__ = [
     "FORWARD",
@@ -23,7 +24,9 @@ __all__ = [
     "Message",
     "MessageReader",
     "ProtocolError",
+    "ServerTLS",
     "StartupPacket",
+    "TLSConfigError",
     "Upstream",
     "Verdict",
     "run_gateway",

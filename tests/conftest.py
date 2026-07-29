@@ -259,3 +259,25 @@ def raw_execute(tk, sql):
         return
     with engine.conn.cursor() as cur:
         cur.execute(sql)
+
+
+# -- benchmark publication --------------------------------------------------
+
+
+@pytest.fixture
+def benchmark():
+    """Record a measurement so the run publishes it rather than discarding it.
+
+    Spec §10.6 asks for benchmarks that publish numbers. Asserting a budget
+    tells you nothing has collapsed; it does not tell you what the number is or
+    which way it has been moving.
+    """
+    from .benchmark_report import REPORT
+
+    return REPORT
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    from .benchmark_report import REPORT
+
+    REPORT.publish(terminalreporter)

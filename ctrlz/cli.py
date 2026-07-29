@@ -129,6 +129,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-attribution", action="store_true",
         help="do not record the connecting user against changes",
     )
+    p.add_argument("--tls-cert", help="PEM certificate served to clients")
+    p.add_argument("--tls-key", help="PEM private key for --tls-cert")
+    p.add_argument(
+        "--tls-ca",
+        help="CA bundle used to verify client certificates (enables mutual TLS)",
+    )
+    p.add_argument(
+        "--require-client-cert", action="store_true",
+        help="reject clients that present no certificate; needs --tls-ca",
+    )
+    p.add_argument(
+        "--require-tls", action="store_true",
+        help="refuse plaintext client connections; needs --tls-cert",
+    )
+    p.add_argument(
+        "--tls-allow-insecure-key", action="store_true",
+        help="permit a private key other users can read (for secrets mounts "
+             "whose permissions you do not control)",
+    )
+    p.add_argument(
+        "--strip-channel-binding", action="store_true",
+        help="remove SCRAM-SHA-256-PLUS from the server's offer so both hops "
+             "can be encrypted; gives up the proof that nothing sits between "
+             "client and database",
+    )
 
     p = sub.add_parser(
         "ship", help="copy this database's history to a shared control plane"
@@ -629,24 +654,52 @@ def _parse_stamp(value):
 def cmd_gateway(toolkit: Toolkit, args) -> int:
     import asyncio
 
-    from .gateway import Gateway, Upstream
+    from .gateway import Gateway, ServerTLS, TLSConfigError, Upstream
 
     upstream_dsn = args.upstream or args.dsn
     if not upstream_dsn:
         print(f"{PROG}: give --upstream or set CTRLZ_DSN", file=sys.stderr)
         return 1
 
+    if bool(args.tls_cert) != bool(args.tls_key):
+        print(
+            f"{PROG}: --tls-cert and --tls-key go together; "
+            f"a certificate without its key cannot serve TLS",
+            file=sys.stderr,
+        )
+        return 1
+
+    tls = None
+    if args.tls_cert:
+        tls = ServerTLS(
+            certfile=args.tls_cert,
+            keyfile=args.tls_key,
+            ca_file=args.tls_ca,
+            require_client_cert=args.require_client_cert,
+            allow_insecure_key_permissions=args.tls_allow_insecure_key,
+        )
+
     tracked = tuple(name for name, _ in toolkit.tracked())
     host, _, port = args.listen.rpartition(":")
     host = host or "127.0.0.1"
 
-    gateway = Gateway(
-        Upstream.from_dsn(upstream_dsn),
-        policy=toolkit.policy,
-        tracked=tracked,
-        environment=toolkit.environment,
-        attribute=not args.no_attribution,
-    )
+    try:
+        gateway = Gateway(
+            Upstream.from_dsn(upstream_dsn),
+            policy=toolkit.policy,
+            tracked=tracked,
+            environment=toolkit.environment,
+            attribute=not args.no_attribution,
+            tls=tls,
+            require_tls=args.require_tls,
+            strip_channel_binding=args.strip_channel_binding,
+        )
+    except TLSConfigError as exc:
+        # Refused at configuration time on purpose: every one of these would
+        # otherwise surface as a client-side failure that says nothing about
+        # the gateway that caused it.
+        print(render.c(f"{PROG}: {exc}", "red"), file=sys.stderr)
+        return 1
 
     print(
         f"{render.c('ctrlz gateway', 'green')} listening on {host}:{port} "
@@ -660,14 +713,26 @@ def cmd_gateway(toolkit: Toolkit, args) -> int:
         "the gateway -- stopping it loses the checkpoint, never the recorder.",
         "dim",
     ))
-    print(render.c(
-        "  Client connections are plaintext: the gateway must read SQL, so it "
-        "cannot pass TLS through. Bind it to localhost or a trusted network.",
-        "yellow",
-    ))
+    if tls is None:
+        print(render.c(
+            "  Client connections are plaintext: SQL and credentials cross the "
+            "network in the clear. Bind to localhost or a trusted segment, or "
+            "pass --tls-cert and --tls-key.",
+            "yellow",
+        ))
+    else:
+        print(render.c(
+            f"  Client TLS enabled ({tls.describe()})"
+            + ("; plaintext refused." if args.require_tls else ".")
+            + "  SIGHUP reloads the certificate.",
+            "green",
+        ))
 
     async def serve() -> None:
+        from .gateway.server import _reload_on_sighup
+
         await gateway.start(host, int(port or 6543))
+        _reload_on_sighup(gateway)
         await gateway.serve_forever()
 
     try:

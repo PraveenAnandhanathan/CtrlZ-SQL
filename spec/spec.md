@@ -288,13 +288,42 @@ Replace regex pre-flight with a real parser behind a stable interface.
 | ID | Requirement | Measured how |
 |---|---|---|
 | NFR-1 | Capture overhead ≤ 2× baseline write latency on tracked tables | benchmark in CI |
-| NFR-2 | Gateway analysis adds < 1 ms p99 | benchmark in CI |
+| NFR-2 | Gateway analysis adds < 1 ms p99 | benchmark in CI — **partially met, see below** |
 | NFR-3 | Gateway failure never blocks database access | fault-injection test |
 | NFR-4 | Zero client-side changes required to use the gateway | integration test with real `psql` |
 | NFR-5 | No credentials, row values, or connection strings in logs | test asserts redaction |
 | NFR-6 | Undo is idempotent — undoing twice is refused, not applied twice | existing test |
 | NFR-7 | Every engine passes the identical behavioural suite | CI matrix |
 | NFR-8 | Python 3.10+; no mandatory C-extension dependency | `pip install ctrlz-sql` on clean env |
+
+### NFR-2, measured
+
+> 🟢 **In plain terms** — we promised the checkpoint would add less than a
+> thousandth of a second to a query. For the same query asked twice it adds
+> about a millionth. For a query it has never seen before, using the default
+> parser, the slowest one in a hundred takes a bit *over* the promise. We are
+> writing that down rather than quietly moving the goalposts.
+
+The budget was asserted for a long time and never reported, which meant the
+only thing CI could tell you was that nothing had regressed by an order of
+magnitude. Now that the numbers are published, they say this (one CI runner,
+`sqlglot` default backend):
+
+| measurement | median | p99 | verdict |
+|---|---:|---:|---|
+| analysis, cold, `sqlglot` | ~0.48 ms | ~1.3 ms | **over the 1 ms budget** |
+| analysis, cold, `regex` | ~0.03 ms | ~0.06 ms | 18× inside |
+| what the gateway adds per statement | ~0.0013 ms | ~0.002 ms | ~500× inside |
+
+The last row is the one NFR-2 was written about: analysis is pure and therefore
+memoised, and real traffic repeats itself constantly — ORMs, dashboards, health
+checks. But a first look at a novel statement does exceed the stated p99 with
+the default backend, and the requirement does not say "amortised".
+
+Two honest options, neither taken unilaterally: restate NFR-2 to describe the
+per-statement cost the gateway actually adds, or change the default backend to
+`regex` and accept lower analysis confidence. The measurement is published on
+every build either way.
 
 ---
 

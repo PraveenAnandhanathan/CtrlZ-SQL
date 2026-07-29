@@ -53,19 +53,22 @@ def measure(call, iterations: int = 200) -> list[float]:
 
 
 @pytest.mark.parametrize("backend", ["sqlglot", "regex"])
-def test_analysis_stays_within_the_gateway_budget(backend):
+def test_analysis_stays_within_the_gateway_budget(backend, benchmark):
     measure(lambda sql: analyze(sql, prefer=backend), iterations=20)  # warm up
     timings = measure(lambda sql: analyze(sql, prefer=backend))
 
-    p99 = percentile(timings, 0.99)
-    median = statistics.median(timings)
-    assert p99 < BUDGET_MS * 10, (
-        f"{backend}: p99 {p99:.3f} ms, median {median:.3f} ms -- an order of "
-        f"magnitude over the {BUDGET_MS} ms budget in NFR-2"
+    recorded = benchmark.record(
+        f"analysis ({backend})", "one statement, parsed and classified",
+        timings, budget_ms=BUDGET_MS,
+    )
+    assert recorded.p99_ms < BUDGET_MS * 10, (
+        f"{backend}: p99 {recorded.p99_ms:.3f} ms, median "
+        f"{recorded.median_ms:.3f} ms -- an order of magnitude over the "
+        f"{BUDGET_MS} ms budget in NFR-2"
     )
 
 
-def test_policy_evaluation_adds_little_over_the_parse():
+def test_policy_evaluation_adds_little_over_the_parse(benchmark):
     """Rule evaluation is a loop over a short list; it should barely register.
 
     If this ever fails, something has crept into a rule that does real work --
@@ -76,6 +79,10 @@ def test_policy_evaluation_adds_little_over_the_parse():
 
     analysis_only = measure(lambda sql: analyze(sql))
     with_policy = measure(lambda sql: engine.evaluate_sql(sql))
+    benchmark.record(
+        "analysis + policy", "one statement, analysed and judged", with_policy,
+        budget_ms=BUDGET_MS,
+    )
 
     overhead = statistics.median(with_policy) - statistics.median(analysis_only)
     assert overhead < BUDGET_MS * 5, (
@@ -96,7 +103,7 @@ def test_the_policy_file_is_read_once_not_per_statement():
 # -- the gateway's own budget ----------------------------------------------
 
 
-def test_the_interceptor_stays_within_the_per_statement_budget():
+def test_the_interceptor_stays_within_the_per_statement_budget(benchmark):
     """NFR-2 measured where it actually applies: the gateway's hot path.
 
     This is the interceptor alone -- no sockets, no database -- because that
@@ -120,13 +127,17 @@ def test_the_interceptor_stays_within_the_per_statement_budget():
         interceptor.inspect(message)
         timings.append((time.perf_counter() - start) * 1000)
 
-    p99 = percentile(timings, 0.99)
-    assert p99 < BUDGET_MS * 10, (
-        f"interceptor p99 {p99:.4f} ms, median {statistics.median(timings):.4f} ms"
+    recorded = benchmark.record(
+        "gateway interceptor", "what the gateway adds per statement", timings,
+        budget_ms=BUDGET_MS,
+    )
+    assert recorded.p99_ms < BUDGET_MS * 10, (
+        f"interceptor p99 {recorded.p99_ms:.4f} ms, "
+        f"median {recorded.median_ms:.4f} ms"
     )
 
 
-def test_repeated_statements_are_cheap():
+def test_repeated_statements_are_cheap(benchmark):
     """Real traffic repeats itself -- ORMs, dashboards, health checks.
 
     Analysis is pure, so the verdict is safe to memoise, and the second look
@@ -148,4 +159,8 @@ def test_repeated_statements_are_cheap():
         interceptor.inspect(message)
     repeat = (time.perf_counter() - start) / 100
 
+    benchmark.record(
+        "gateway interceptor (repeat)", "a statement already seen",
+        [repeat * 1000] * 3, budget_ms=BUDGET_MS,
+    )
     assert repeat < first, f"cached lookup ({repeat*1000:.4f} ms) not faster than first"

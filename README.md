@@ -226,32 +226,69 @@ to render it.
 |---|---|
 | **No connection pooling** | one upstream connection per client. Multiplexing sessions would break `SET LOCAL`, temp tables and transactions in ways that are hard to see and impossible to explain |
 | **No credential handling** | authentication is relayed verbatim, which is exactly why `md5` and SCRAM work. The cost: we cannot learn the authenticated identity, so attribution uses the startup packet's `user` and `application_name` |
-| **No TLS from the client** | it must read SQL, so it declines `SSLRequest`. **Bind it to localhost or a trusted segment** |
-| **Upstream TLS is off by default** | not libpq's default, and deliberately so — see below |
+| **No connection multiplexing** | see above |
 | **Not required for undo** | capture lives inside the database. Stop the gateway and every change is still recorded and still reversible |
 
-### Upstream TLS and channel binding
+### TLS
 
-`?sslmode=` on the upstream DSN is honoured for the gateway-to-database hop —
-`require`, `verify-ca` and `verify-full` all work, and only `verify-full`
-checks the hostname, exactly as libpq defines them.
+The two hops are configured separately, because they are different trust
+decisions. The **client** hop is usually the one crossing untrusted network;
+the **database** hop is usually the near one.
 
-It defaults to `disable` rather than libpq's `prefer`, and the reason is worth
-knowing before you change it. If the database hop is encrypted while the client
-hop is not, PostgreSQL offers **SCRAM-SHA-256-PLUS** — channel binding — because
-from its side the connection is protected. The gateway relays that challenge to
-a client on a plaintext socket, and the client correctly refuses:
+```bash
+ctrlz gateway --listen 0.0.0.0:6543 \
+  --upstream postgresql://localhost/app \
+  --tls-cert /etc/ctrlz/server.crt \
+  --tls-key  /etc/ctrlz/server.key \
+  --require-tls
+```
+
+| flag | effect |
+|---|---|
+| `--tls-cert` / `--tls-key` | serve TLS to clients. Without them `SSLRequest` is declined and everything is plaintext |
+| `--require-tls` | refuse plaintext clients — the `hostssl` equivalent. The refusal is a rendered error, not a dropped socket |
+| `--tls-ca` | verify client certificates against this CA (mutual TLS) |
+| `--require-client-cert` | reject clients presenting none. Needs `--tls-ca`, and says so if you forget |
+| `--tls-allow-insecure-key` | permit a group- or world-readable private key |
+
+A private key other users can read is **refused**, exactly as PostgreSQL
+refuses to start with one. TLS 1.2 is the floor. Certificates load before the
+port binds, so a bad path fails while you are watching. **`SIGHUP` reloads
+them** — a certificate renewal should not cost every open session, and a
+reload that fails keeps the running certificate rather than ending the service.
+
+`?sslmode=` on the upstream DSN is honoured for the database hop — `require`,
+`verify-ca` and `verify-full` all work, and only `verify-full` checks the
+hostname, exactly as libpq defines them.
+
+### Why you cannot encrypt both hops
+
+The gateway **refuses to start** if you configure a client certificate *and* an
+encrypted upstream. Not an oversight — the alternative is a configuration that
+starts cleanly and then fails at authentication with a client-side error that
+never mentions the gateway.
+
+An encrypted upstream makes PostgreSQL offer **SCRAM-SHA-256-PLUS**, whose
+channel binding ties the authentication exchange to one specific TLS session so
+that a man-in-the-middle cannot relay it. There are two TLS sessions here and
+the gateway is the thing in the middle, so the binding data cannot match:
 
 ```
 server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection
 ```
 
-That is channel binding working exactly as designed. It exists to stop a
-man-in-the-middle from relaying an authentication exchange, and a proxy that
-reads your SQL *is* a man-in-the-middle. No amount of care on our side changes
-that. The honest options are to leave both hops in the same state (the default),
-or to secure the client hop too — which needs a certificate and is not something
-to half-build. The gateway logs a warning when you enable upstream TLS.
+That is channel binding working exactly as designed, against exactly the thing
+it was designed against. **Encrypt the hop that crosses untrusted network and
+leave the other plaintext** — usually: keep the certificate, `sslmode=disable`
+upstream.
+
+If both hops genuinely must be encrypted, `--strip-channel-binding` removes
+SCRAM-SHA-256-PLUS from the server's offer so clients fall back to plain
+SCRAM-SHA-256. Both hops stay encrypted and the password is still never sent in
+clear; what you give up is the proof that nothing sits between client and
+database — and something does. This. It is opt-in, it logs a warning at
+startup and on every downgrade, and if stripping would leave the server with no
+mechanisms at all the offer is passed through untouched.
 
 ### It fails open, always
 
