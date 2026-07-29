@@ -631,17 +631,10 @@ def _dsn_hint(engine) -> str:
     """Where to go to undo something. Never a password.
 
     The hub tells you which database an operation happened in; it does not
-    hold the means to connect to it.
+    hold the means to connect to it. The stripping itself belongs to the
+    engine, so there is only ever one implementation of it.
     """
-    dsn = getattr(engine, "dsn", None) or getattr(engine, "path", "")
-    if not dsn:
-        return ""
-    parsed = urlparse(str(dsn))
-    if not parsed.scheme:
-        return str(dsn)
-    host = parsed.hostname or ""
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{host}{port}{parsed.path}"
+    return engine.describe_target()
 
 
 def _now() -> str:

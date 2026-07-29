@@ -145,6 +145,29 @@ class Engine(abc.ABC):
         self.set_setting("source_id", minted)
         return minted
 
+    def describe_target(self) -> str:
+        """Where this engine is connected, with any password removed.
+
+        Printed by `init` and `doctor` so that "it worked" is never the only
+        thing a user has to go on. If ctrlz opened something other than the
+        database they meant, seeing the target says so immediately -- and no
+        amount of validation upstream can be as convincing as that.
+
+        Credential stripping lives here, in one place, because a second
+        implementation of it is how a password reaches a log file.
+        """
+        from urllib.parse import urlparse
+
+        target = getattr(self, "dsn", None) or getattr(self, "path", "")
+        if not target:
+            return ""
+        parsed = urlparse(str(target))
+        if not parsed.scheme:
+            return str(target)
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{host}{port}{parsed.path}"
+
     # -- helpers -----------------------------------------------------------
 
     def resolve_op_id(self, ref: str) -> str:

@@ -52,13 +52,9 @@ def connect(
 def _engine_for(dsn: str) -> Engine:
     scheme = urlparse(dsn).scheme.lower()
     if scheme in ("postgres", "postgresql", "psql"):
-        from .engines.postgres import PostgresEngine
-
-        return PostgresEngine(dsn)
+        return _open("postgres", dsn, "psycopg2", "ctrlz-sql[postgres]")
     if scheme in ("mysql", "mariadb"):
-        from .engines.mysql import MySQLEngine
-
-        return MySQLEngine(dsn)
+        return _open("mysql", dsn, "pymysql", "ctrlz-sql[mysql]")
     if scheme == "sqlite":
         # sqlite:///relative.db and sqlite:////absolute/path.db, per the usual
         # convention: exactly one slash belongs to the authority separator.
@@ -66,9 +62,80 @@ def _engine_for(dsn: str) -> Engine:
         rest = rest[2:] if rest.startswith("//") else rest
         path = rest[1:] if rest.startswith("/") else rest
         return _sqlite(path or ":memory:")
-    if scheme in ("", "file"):
-        return _sqlite(dsn[len("file://"):] if scheme == "file" else dsn)
+    if scheme == "file":
+        return _sqlite(dsn[len("file://"):])
+    if scheme == "":
+        return _sqlite(_bare_path(dsn))
     raise ConfigError(f"unsupported database URL scheme: {scheme!r}")
+
+
+#: Suffixes that make a scheme-less string recognisable as a SQLite file.
+SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3", ".db3")
+
+
+def _bare_path(dsn: str) -> str:
+    """Accept ``app.db`` as a SQLite path -- but only when it looks like one.
+
+    A scheme-less DSN used to be treated as a SQLite path unconditionally, so a
+    mistyped or unexpanded connection string quietly created an empty local
+    database instead of failing. Everything then reported success: `init` said
+    it had installed, `doctor` said `initialized: yes`, and the production
+    database the user meant was never protected at all.
+
+    A tool whose entire purpose is protecting data must not have a failure mode
+    where it appears to be working and is not. So the convenience shorthand now
+    has to earn it: a path separator, a SQLite suffix, `:memory:`, or a file
+    that already exists. Anything else is more likely a mistake than an intent,
+    and is refused by name.
+    """
+    candidate = dsn.strip()
+    looks_like_a_path = (
+        candidate == ":memory:"
+        or os.sep in candidate
+        or "/" in candidate
+        or candidate.lower().endswith(SQLITE_SUFFIXES)
+        or os.path.exists(candidate)
+    )
+    if not looks_like_a_path:
+        raise ConfigError(
+            f"{dsn!r} is not a database URL, and does not look like a path to a "
+            f"SQLite file, so ctrlz will not create one under that name.\n"
+            f"  For SQLite, be explicit:  sqlite:///{candidate or 'app'}.db\n"
+            f"  For a server, include the scheme:  "
+            f"postgresql://user@host/db  or  mysql://user@host/db"
+        )
+    return candidate
+
+
+def _open(engine: str, dsn: str, module: str, extra: str) -> Engine:
+    """Open an engine, turning a missing driver into an answerable message.
+
+    Postgres and MySQL drivers are optional extras, so the most likely first
+    run for a Postgres user is the one where the driver is absent. A traceback
+    ending in ModuleNotFoundError is a true statement of the problem and a
+    useless statement of the remedy.
+
+    Both the import and the construction are wrapped, because the two engines
+    do not agree on when they reach for their driver: Postgres imports psycopg2
+    at module level, MySQL imports pymysql inside __init__. Covering only the
+    import would have left MySQL users with the traceback this exists to
+    prevent -- which is exactly what happened until a test said so.
+    """
+    try:
+        if engine == "postgres":
+            from .engines.postgres import PostgresEngine
+
+            return PostgresEngine(dsn)
+        from .engines.mysql import MySQLEngine
+
+        return MySQLEngine(dsn)
+    except ImportError as exc:
+        if module not in str(exc):
+            raise
+        raise ConfigError(
+            f"{engine} support needs the {module!r} driver, which is not "
+            f"installed.\n  Install it with:  pip install '{extra}'"
+        ) from exc
 
 
 def _sqlite(path: str) -> Engine:
@@ -251,6 +318,7 @@ class Toolkit:
     def doctor(self) -> dict[str, object]:
         info: dict[str, object] = {
             "engine": self.engine.name,
+            "target": self.engine.describe_target(),
             "initialized": self.engine.is_initialized(),
             "caveats": list(self.engine.caveats),
             "policy_source": self.policy.source,

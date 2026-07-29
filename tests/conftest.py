@@ -8,12 +8,40 @@ import ctrlz
 PG_DSN = os.environ.get("CTRLZ_TEST_PG_DSN")
 MYSQL_DSN = os.environ.get("CTRLZ_TEST_MYSQL_DSN")
 
+#: Engines whose tests must not be skipped, as a comma-separated list.
+#:
+#: Skipping when a DSN is absent is right on a laptop and wrong in CI. Without
+#: this, `pytest -q` exits 0 whether or not Postgres and MySQL were ever
+#: reached: a service container that failed to start, a renamed variable or a
+#: typo'd DSN would all produce a green check that had proved only that SQLite
+#: works. A test suite that cannot fail for the reason you care about is not
+#: evidence, and a badge based on one is worse than no badge.
+REQUIRED = {
+    name.strip().lower()
+    for name in os.environ.get("CTRLZ_REQUIRE_ENGINES", "").split(",")
+    if name.strip()
+}
+
 
 def pytest_report_header(config):
+    required = f"; required: {', '.join(sorted(REQUIRED))}" if REQUIRED else ""
     return (
         f"ctrlz: postgres {'enabled' if PG_DSN else 'skipped'}, "
-        f"mysql {'enabled' if MYSQL_DSN else 'skipped'}"
+        f"mysql {'enabled' if MYSQL_DSN else 'skipped'}{required}"
     )
+
+
+def require(engine: str, dsn, variable: str) -> None:
+    """Skip for want of a database -- unless this run promised to have one."""
+    if dsn:
+        return
+    message = f"set {variable} to run the {engine} tests"
+    if engine in REQUIRED:
+        pytest.fail(
+            f"{variable} is not set, but CTRLZ_REQUIRE_ENGINES demands "
+            f"{engine}. Refusing to pass by skipping."
+        )
+    pytest.skip(message)
 
 
 #: Behavioural tests MySQL cannot pass, every one for the same reason: InnoDB
@@ -84,8 +112,7 @@ def sqlite_db(tmp_path):
 @pytest.fixture
 def pg_db():
     """A throwaway schema in a real Postgres, with ctrlz installed."""
-    if not PG_DSN:
-        pytest.skip("set CTRLZ_TEST_PG_DSN to run the Postgres tests")
+    require("postgres", PG_DSN, "CTRLZ_TEST_PG_DSN")
 
     import psycopg2
 
@@ -155,8 +182,7 @@ def mysql_db():
     Giving MySQL an easier schema would hide the one thing this engine exists
     to discover.
     """
-    if not MYSQL_DSN:
-        pytest.skip("set CTRLZ_TEST_MYSQL_DSN to run the MySQL tests")
+    require("mysql", MYSQL_DSN, "CTRLZ_TEST_MYSQL_DSN")
 
     import pymysql
     from urllib.parse import urlparse

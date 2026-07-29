@@ -16,7 +16,12 @@ import pytest
 import ctrlz
 from ctrlz.migrations import CURRENT_VERSION, attribution_columns, pending
 
-from .v1_schema import V1_POSTGRES_SCHEMA, V1_SQLITE_SCHEMA, v1_sqlite_trigger
+from .conftest import require
+from .v1_schema import (
+    V1_POSTGRES_SCHEMA,
+    V1_SQLITE_SCHEMA,
+    v1_sqlite_trigger,
+)
 
 PG_DSN_ENV = "CTRLZ_TEST_PG_DSN"
 
@@ -201,8 +206,7 @@ def v1_postgres(request):
     import os
 
     dsn = os.environ.get(PG_DSN_ENV)
-    if not dsn:
-        pytest.skip(f"set {PG_DSN_ENV} to run the Postgres migration tests")
+    require("postgres", dsn, PG_DSN_ENV)
 
     import psycopg2
 

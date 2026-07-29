@@ -57,4 +57,22 @@ jobs:
         env:
           CTRLZ_TEST_PG_DSN: postgresql://ctrlz:ctrlz@127.0.0.1:5432/ctrlz_test
           CTRLZ_TEST_MYSQL_DSN: mysql://root:ctrlz@127.0.0.1:3306/ctrlz_test
+          # Turn "no database, so skip" into a failure. Without this the suite
+          # exits 0 having tested only SQLite if a service container never came
+          # up, and the badge would say nothing about the other two engines.
+          CTRLZ_REQUIRE_ENGINES: postgres,mysql
         run: pytest -q
+
+      - name: Check the package installs and runs from a built wheel
+        # Everything above runs from a source checkout with dev extras. What a
+        # user actually gets is the wheel, and only this step tests that -- the
+        # policy file being packaged, the console script existing, the import
+        # graph working without the dev dependencies present.
+        run: |
+          python -m pip install --quiet build
+          python -m build --wheel --outdir dist_check
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install --quiet dist_check/*.whl
+          /tmp/wheelcheck/bin/ctrlz --version
+          /tmp/wheelcheck/bin/ctrlz --dsn sqlite:///$RUNNER_TEMP/w.db init
+          /tmp/wheelcheck/bin/ctrlz --dsn sqlite:///$RUNNER_TEMP/w.db doctor
