@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import shutil
 import ssl
-import stat
 import subprocess
 
 import pytest
@@ -292,6 +291,12 @@ def test_a_failed_handshake_does_not_stop_the_gateway(sandbox, tmp_path):
 @requires_openssl
 @requires_psql
 def test_a_required_client_certificate_is_enforced(sandbox, tmp_path):
+    """A client with a certificate gets in; one without is refused.
+
+    The positive half runs through a real `psql`, because that is the client
+    people will actually use. The negative half does the handshake directly --
+    see `tls_handshake` for why asserting on psql's wording was a mistake.
+    """
     ca_cert, ca_key = make_cert(tmp_path, name="ca", common_name="ctrlz-test-ca")
     server_cert, server_key = make_cert(
         tmp_path, name="server", common_name="localhost", ca=(ca_cert, ca_key)
@@ -305,17 +310,32 @@ def test_a_required_client_certificate_is_enforced(sandbox, tmp_path):
         ca_file=ca_cert, require_client_cert=True,
     )
     with RunningGateway(sandbox.dsn, tls=tls) as gw:
-        without = psql_tls(gw.port, "require", "SELECT 1")
         with_cert = psql_tls(gw.port, "require", "SELECT 1",
                              client_cert=client_cert, client_key=client_key)
+        assert with_cert.returncode == 0, with_cert.stderr
 
-    assert with_cert.returncode == 0, with_cert.stderr
-    assert without.returncode != 0, "a client with no certificate must be refused"
-    # Refused during the handshake, which is the only place it can be: the
-    # server has no way to send an application-level error before TLS is up.
-    # Asserting the layer distinguishes this from a refusal for some other
-    # reason, which is what a bare non-zero exit would have allowed.
-    assert "SSL" in without.stderr, without.stderr
+        # No certificate: the handshake itself must fail, which is the only
+        # place it can -- there is no way to send an application-level error
+        # before TLS is up.
+        with pytest.raises(HandshakeRefused):
+            tls_handshake(gw.port)
+
+        # And the same handshake with a certificate completes, so the failure
+        # above is attributable to the missing certificate and nothing else.
+        tls_handshake(gw.port, client_cert=client_cert, client_key=client_key)
+
+
+@requires_openssl
+def test_client_certificates_are_optional_unless_required(sandbox, tmp_path):
+    """A CA without --require-client-cert accepts clients that present none."""
+    ca_cert, ca_key = make_cert(tmp_path, name="ca", common_name="ctrlz-test-ca")
+    server_cert, server_key = make_cert(
+        tmp_path, name="server", common_name="localhost", ca=(ca_cert, ca_key)
+    )
+    tls = ServerTLS(certfile=server_cert, keyfile=server_key, ca_file=ca_cert)
+
+    with RunningGateway(sandbox.dsn, tls=tls) as gw:
+        tls_handshake(gw.port)        # must not raise
 
 
 # -- reload ----------------------------------------------------------------
@@ -424,6 +444,76 @@ def sasl_offer(mechanisms: list[bytes]):
     payload = struct.pack("!I", p.AUTH_SASL)
     payload += b"".join(name + b"\x00" for name in mechanisms) + b"\x00"
     return p.Message(p.AUTHENTICATION, payload)
+
+
+# -- doing the handshake ourselves -----------------------------------------
+
+
+class HandshakeRefused(Exception):
+    """The gateway would not carry on with this TLS connection."""
+
+
+def tls_handshake(port: int, client_cert: str = "", client_key: str = "") -> None:
+    """Drive PostgreSQL's SSLRequest dance and see whether we are let in.
+
+    Exists because asserting on `psql`'s error text was a mistake I made and
+    CI caught. A rejected handshake is reported by libpq as "SSL SYSCALL
+    error: EOF detected" on one build and "server closed the connection
+    unexpectedly" on another. Both are correct; a test pinned to either passes
+    for the right reason on one machine and fails on the other. That wording
+    belongs to libpq, not to us.
+
+    Detecting the refusal is subtler than "an exception is raised", which was
+    my second mistake. Under TLS 1.3 the server asks for a client certificate
+    *after* the client believes the handshake is finished, so a client with
+    none completes `wrap_socket` happily and learns of the rejection as a
+    clean end-of-stream. Refusal therefore means any of: an SSL alert, a
+    reset, or EOF with nothing read.
+
+    Acceptance is the read *timing out* -- the gateway is holding the
+    connection open waiting for a startup packet, which is exactly what being
+    let in looks like.
+    """
+    import socket
+    import struct
+
+    from ctrlz.gateway import protocol as p
+
+    sock = socket.create_connection(("127.0.0.1", port), timeout=15)
+    wrapped = None
+    try:
+        sock.sendall(struct.pack("!II", 8, p.SSL_REQUEST))
+        answer = sock.recv(1)
+        assert answer == p.SSL_ACCEPTED, f"gateway declined TLS: {answer!r}"
+
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        if client_cert:
+            context.load_cert_chain(client_cert, client_key)
+
+        try:
+            wrapped = context.wrap_socket(sock)
+        except ssl.SSLError as exc:
+            raise HandshakeRefused(f"rejected during the handshake: {exc}") from exc
+
+        wrapped.settimeout(3)
+        try:
+            if wrapped.recv(1) == b"":
+                raise HandshakeRefused("connection closed with nothing sent")
+        except socket.timeout:
+            return          # held open, waiting for a startup packet: accepted
+        except ssl.SSLError as exc:
+            raise HandshakeRefused(f"rejected after the handshake: {exc}") from exc
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        raise HandshakeRefused(f"connection reset: {exc}") from exc
+    finally:
+        for handle in (wrapped, sock):
+            try:
+                if handle is not None:
+                    handle.close()
+            except OSError:
+                pass
 
 
 # -- driving psql over TLS -------------------------------------------------
