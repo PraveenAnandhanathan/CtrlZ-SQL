@@ -91,3 +91,61 @@ def test_the_policy_file_is_read_once_not_per_statement():
         engine.evaluate_sql(sql)
     assert engine.policy.source == source
     assert engine.policy is engine.policy
+
+
+# -- the gateway's own budget ----------------------------------------------
+
+
+def test_the_interceptor_stays_within_the_per_statement_budget():
+    """NFR-2 measured where it actually applies: the gateway's hot path.
+
+    This is the interceptor alone -- no sockets, no database -- because that
+    is the part we add to every statement. Network time is the same whether
+    the gateway is there or not.
+    """
+    from ctrlz.gateway import Interceptor, protocol
+
+    interceptor = Interceptor(tracked=("users", "orders"))
+    messages = [
+        protocol.Message(protocol.QUERY, sql.encode() + b"\x00") for sql in STATEMENTS
+    ]
+
+    for index in range(20):
+        interceptor.inspect(messages[index % len(messages)])
+
+    timings: list[float] = []
+    for index in range(400):
+        message = messages[index % len(messages)]
+        start = time.perf_counter()
+        interceptor.inspect(message)
+        timings.append((time.perf_counter() - start) * 1000)
+
+    p99 = percentile(timings, 0.99)
+    assert p99 < BUDGET_MS * 10, (
+        f"interceptor p99 {p99:.4f} ms, median {statistics.median(timings):.4f} ms"
+    )
+
+
+def test_repeated_statements_are_cheap():
+    """Real traffic repeats itself -- ORMs, dashboards, health checks.
+
+    Analysis is pure, so the verdict is safe to memoise, and the second look
+    at a statement should cost almost nothing.
+    """
+    from ctrlz.gateway import Interceptor, protocol
+
+    interceptor = Interceptor(tracked=("users",))
+    message = protocol.Message(
+        protocol.QUERY, b"UPDATE users SET salary = 1 WHERE id = 5\x00"
+    )
+
+    start = time.perf_counter()
+    interceptor.inspect(message)
+    first = time.perf_counter() - start
+
+    start = time.perf_counter()
+    for _ in range(100):
+        interceptor.inspect(message)
+    repeat = (time.perf_counter() - start) / 100
+
+    assert repeat < first, f"cached lookup ({repeat*1000:.4f} ms) not faster than first"

@@ -108,6 +108,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--older-than", help="e.g. 30m, 24h, 7d; omit to delete everything")
     p.add_argument("--yes", action="store_true")
 
+    p = sub.add_parser(
+        "gateway",
+        help="run a checkpoint in front of the database that every client can use",
+    )
+    p.add_argument(
+        "--listen", default="127.0.0.1:6543",
+        help="address to accept client connections on (default 127.0.0.1:6543)",
+    )
+    p.add_argument(
+        "--upstream",
+        help="the real database to proxy to; defaults to --dsn / $CTRLZ_DSN",
+    )
+    p.add_argument(
+        "--no-attribution", action="store_true",
+        help="do not record the connecting user against changes",
+    )
+
     sub.add_parser("doctor", help="report what is and is not protected")
     return parser
 
@@ -439,6 +456,63 @@ def cmd_purge(toolkit: Toolkit, args) -> int:
         return 1
     deleted = toolkit.purge(args.older_than)
     print(render.c(f"Purged {deleted} operation(s).", "green"))
+    return 0
+
+
+def cmd_gateway(toolkit: Toolkit, args) -> int:
+    import asyncio
+
+    from .gateway import Gateway, Upstream
+
+    upstream_dsn = args.upstream or args.dsn
+    if not upstream_dsn:
+        print(f"{PROG}: give --upstream or set CTRLZ_DSN", file=sys.stderr)
+        return 1
+
+    tracked = tuple(name for name, _ in toolkit.tracked())
+    host, _, port = args.listen.rpartition(":")
+    host = host or "127.0.0.1"
+
+    gateway = Gateway(
+        Upstream.from_dsn(upstream_dsn),
+        policy=toolkit.policy,
+        tracked=tracked,
+        environment=toolkit.environment,
+        attribute=not args.no_attribution,
+    )
+
+    print(
+        f"{render.c('ctrlz gateway', 'green')} listening on {host}:{port} "
+        f"-> {gateway.upstream.host}:{gateway.upstream.port}"
+    )
+    print(render.c(
+        f"  {len(tracked)} tracked table(s); {len(toolkit.policy.rules)} rule(s) "
+        f"from {toolkit.policy.source}", "dim"))
+    print(render.c(
+        "  Point your client at this address. Capture and undo do not depend on "
+        "the gateway -- stopping it loses the checkpoint, never the recorder.",
+        "dim",
+    ))
+    print(render.c(
+        "  Client connections are plaintext: the gateway must read SQL, so it "
+        "cannot pass TLS through. Bind it to localhost or a trusted network.",
+        "yellow",
+    ))
+
+    async def serve() -> None:
+        await gateway.start(host, int(port or 6543))
+        await gateway.serve_forever()
+
+    try:
+        asyncio.run(serve())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print(
+            f"\nStopped. {gateway.stats.connections} connection(s), "
+            f"{gateway.stats.statements} statement(s) checked, "
+            f"{gateway.stats.refused} refused."
+        )
     return 0
 
 

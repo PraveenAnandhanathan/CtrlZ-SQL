@@ -25,7 +25,13 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["psycopg2-binary>=2.9"]
 pg-parser = ["pglast>=6"]
-dev = ["psycopg2-binary>=2.9", "pglast>=6", "pytest>=7"]
+dev = [
+    "psycopg2-binary>=2.9",
+    "psycopg[binary]>=3.1",
+    "pglast>=6",
+    "sqlalchemy>=2",
+    "pytest>=7",
+]
 
 [project.scripts]
 ctrlz = "ctrlz.cli:main"
