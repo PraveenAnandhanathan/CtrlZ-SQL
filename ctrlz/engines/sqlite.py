@@ -744,6 +744,21 @@ class SQLiteEngine(Engine):
         fragment = "".join(f" AND {self._quote(c)} IS ?" for c in usable)
         return fragment, [_encode_value(expected.get(c)) for c in usable]
 
+    # -- settings ----------------------------------------------------------
+
+    def get_setting(self, key: str) -> Optional[str]:
+        self._require_init()
+        row = self._one("SELECT value FROM ctrlz_settings WHERE key = ?", (key,))
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._require_init()
+        self.conn.execute(
+            "INSERT INTO ctrlz_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
     # -- retention ---------------------------------------------------------
 
     def purge(self, older_than_seconds: Optional[int] = None) -> int:

@@ -96,6 +96,33 @@ class Engine(abc.ABC):
     @abc.abstractmethod
     def purge(self, older_than_seconds: Optional[int] = None) -> int: ...
 
+    # -- settings ----------------------------------------------------------
+
+    @abc.abstractmethod
+    def get_setting(self, key: str) -> Optional[str]:
+        """Read a value from the metadata store, or None."""
+
+    @abc.abstractmethod
+    def set_setting(self, key: str, value: str) -> None:
+        """Write a value to the metadata store."""
+
+    def source_id(self) -> str:
+        """A stable identity for this database, minted on first use.
+
+        The control plane needs to tell two databases apart, and a DSN will
+        not do: the same database is reached by different host names from
+        different machines, and a copy restored from a backup would otherwise
+        look like the original.
+        """
+        import uuid as _uuid
+
+        existing = self.get_setting("source_id")
+        if existing:
+            return existing
+        minted = _uuid.uuid4().hex
+        self.set_setting("source_id", minted)
+        return minted
+
     # -- helpers -----------------------------------------------------------
 
     def resolve_op_id(self, ref: str) -> str:

@@ -125,6 +125,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not record the connecting user against changes",
     )
 
+    p = sub.add_parser(
+        "ship", help="copy this database's history to a shared control plane"
+    )
+    p.add_argument("--to", required=True, help="hub DSN (sqlite:///... or postgresql://...)")
+    p.add_argument("--name", help="what to call this database in the hub")
+    p.add_argument(
+        "--include-values",
+        action="store_true",
+        help="also ship before/after row values (off by default: shipping data "
+        "off the database it came from should be a deliberate choice)",
+    )
+    p.add_argument("--batch", type=int, default=1000, help="rows per run")
+
+    p = sub.add_parser("hub", help="read the shared control plane")
+    p.add_argument(
+        "action", nargs="?", default="log", choices=("log", "sources", "purge")
+    )
+    p.add_argument("--at", required=True, help="hub DSN")
+    p.add_argument("-n", "--limit", type=int, default=50)
+    p.add_argument("--source", help="filter by source name or id")
+    p.add_argument("--actor", help="filter by who made the change")
+    p.add_argument("--table", help="filter by table touched")
+    p.add_argument("--min-risk", type=int, help="only operations at or above this risk")
+    p.add_argument("--older-than", help="for purge: e.g. 30d")
+    p.add_argument("--yes", action="store_true")
+
     sub.add_parser("doctor", help="report what is and is not protected")
     return parser
 
@@ -457,6 +483,137 @@ def cmd_purge(toolkit: Toolkit, args) -> int:
     deleted = toolkit.purge(args.older_than)
     print(render.c(f"Purged {deleted} operation(s).", "green"))
     return 0
+
+
+def cmd_ship(toolkit: Toolkit, args) -> int:
+    from .hub import Hub, ship
+
+    hub = Hub(args.to)
+    try:
+        result = ship(
+            toolkit,
+            hub,
+            name=args.name,
+            include_values=args.include_values,
+            batch=args.batch,
+        )
+    finally:
+        hub.close()
+
+    if args.json:
+        print(json.dumps(result.__dict__, indent=2, default=str))
+        return 0
+
+    print(
+        render.c("Shipped.", "green")
+        + f" {result.operations} operation(s), {result.changes} change(s) "
+        f"from {result.source_name}."
+    )
+    if result.refreshed:
+        print(render.c(f"  {result.refreshed} operation(s) marked undone.", "dim"))
+    if not result.included_values:
+        print(render.c(
+            "  Metadata only. Row values stayed in the source database; pass "
+            "--include-values to ship them too.", "dim"))
+    print(render.c(f"  Watermark now {result.watermark}. Safe to run again.", "dim"))
+    return 0
+
+
+def cmd_hub(toolkit: Toolkit, args) -> int:
+    from .hub import Hub
+
+    hub = Hub(args.at)
+    try:
+        if args.action == "sources":
+            return _hub_sources(hub, args)
+        if args.action == "purge":
+            return _hub_purge(hub, args)
+        return _hub_log(hub, args)
+    finally:
+        hub.close()
+
+
+def _hub_log(hub, args) -> int:
+    operations = hub.operations(
+        limit=args.limit,
+        source=args.source,
+        actor=args.actor,
+        table=args.table,
+        min_risk=args.min_risk,
+    )
+    if args.json:
+        print(json.dumps([op.__dict__ for op in operations], indent=2, default=str))
+        return 0
+    if not operations:
+        print(render.c("No shipped operations match.", "dim"))
+        return 0
+
+    rows = [
+        [
+            render.c(render.short(op.op_id), "bold"),
+            render.truncate(op.source_name, 16),
+            render.ago(op.started_at),
+            render.c("undone", "dim") if op.already_undone else "",
+            str(op.row_count),
+            "-" if op.risk is None else str(op.risk),
+            render.truncate(op.actor, 14),
+            render.truncate(", ".join(op.tables) or "-", 26),
+            render.truncate(op.label or "(unlabelled)", 30),
+        ]
+        for op in operations
+    ]
+    print(render.table(
+        rows,
+        ["ID", "SOURCE", "WHEN", "STATE", "ROWS", "RISK", "ACTOR", "TABLES", "LABEL"],
+    ))
+    print()
+    print(render.c(
+        "This is a replica. To reverse any of these, connect to the source "
+        "database\nand run `ctrlz undo <id>` there -- the hub never applies "
+        "changes itself.", "dim"))
+    return 0
+
+
+def _hub_sources(hub, args) -> int:
+    sources = hub.sources()
+    if args.json:
+        print(json.dumps(sources, indent=2, default=str))
+        return 0
+    if not sources:
+        print(render.c("No databases have shipped to this hub yet.", "dim"))
+        return 0
+    rows = [
+        [
+            render.c(s["name"], "bold"),
+            s.get("engine") or "-",
+            s.get("dsn_hint") or "-",
+            str(s.get("watermark") or 0),
+            render.ago(_parse_stamp(s.get("last_ship"))),
+        ]
+        for s in sources
+    ]
+    print(render.table(rows, ["NAME", "ENGINE", "WHERE", "WATERMARK", "LAST SHIP"]))
+    return 0
+
+
+def _hub_purge(hub, args) -> int:
+    from .api import parse_duration
+
+    what = f"older than {args.older_than}" if args.older_than else "ALL shipped history"
+    if not args.yes and not _confirm(f"Delete {what} from the hub?"):
+        print("Cancelled.")
+        return 1
+    seconds = parse_duration(args.older_than) if args.older_than else None
+    deleted = hub.purge(seconds)
+    print(render.c(f"Purged {deleted} operation(s) from the hub.", "green"))
+    print(render.c("  The source databases were not touched.", "dim"))
+    return 0
+
+
+def _parse_stamp(value):
+    from .hub import _parse
+
+    return _parse(value)
 
 
 def cmd_gateway(toolkit: Toolkit, args) -> int:

@@ -272,6 +272,48 @@ holds at one door and not another is worse than no rule, because the same
 statement is refused or permitted depending on how the application happened to
 connect, and nothing makes that visible.
 
+## Team history
+
+> 🟢 Every database keeps its own recording. This collects copies into one place
+> a team can search, without logging into each database in turn.
+
+```console
+$ ctrlz ship --to sqlite:///team-history.db --name billing-prod
+Shipped. 2 operation(s), 2 change(s) from billing-prod.
+  Metadata only. Row values stayed in the source database; pass --include-values
+  to ship them too.
+  Watermark now 2. Safe to run again.
+
+$ ctrlz hub log --at sqlite:///team-history.db
+ID        SOURCE        WHEN    STATE   ROWS  RISK  ACTOR    TABLES  LABEL
+2b310110  billing-prod  1m ago          1     0     praveen  users   remove bob
+bf5c0bd3  billing-prod  2m ago  undone  1     0     ada      users   raise ada
+```
+
+Filter with `--source`, `--actor`, `--table`, `--min-risk`. The hub itself runs
+on SQLite or PostgreSQL.
+
+Three rules, each about not letting a convenience become a liability:
+
+- **It is a replica, never the source of truth.** Shipping crosses a
+  transaction boundary and can fail, lag or be interrupted. If the hub and the
+  database disagree, the database is right.
+- **Undo is never orchestrated from the hub.** It records *where* an operation
+  happened; reversing it means connecting to that database. A hub that could
+  undo could undo *stale* data, with no way to know it was stale. A test
+  asserts the `Hub` class exposes no `undo`, `apply` or `execute` — the absence
+  is the design.
+- **Metadata by default, row values only on request.** Without
+  `--include-values` the hub learns what changed and by how much, never what
+  the values were. A test greps the entire hub for a salary that was never
+  meant to leave.
+
+`ctrlz ship` is idempotent and resumable — progress is a watermark over the
+change log's sequence, advanced only after a batch lands, and every write is an
+upsert. Run it from cron; an interruption costs a repeat, never a gap. An undo
+that happens *after* shipping is picked up on the next run, because a watermark
+cannot see a column being set on a row already copied.
+
 ## Attribution
 
 Every operation records who made it:
@@ -364,6 +406,8 @@ Known limits
 | `ctrlz check "<sql>"` | run the guardrails without executing (exit 0/1/2) |
 | `ctrlz purge --older-than 24h` | trim history |
 | `ctrlz gateway` | run the checkpoint in front of the database |
+| `ctrlz ship --to <dsn>` | copy this database's history to a shared hub |
+| `ctrlz hub log\|sources\|purge --at <dsn>` | read the shared hub |
 | `ctrlz doctor` | what is protected, what is not, and what cannot be promised |
 
 Operations can be named by id prefix (`ctrlz undo 97e9ce62`) or by `last`.
