@@ -85,6 +85,7 @@ class Report:
             lines.append(
                 f"{m.name.ljust(width)}   {m.median_ms:6.4f}   {m.p99_ms:6.4f}   "
                 f"{budget:>6}  {m.headroom:>13}"
+                + (f"   {m.note}" if m.note else "")
             )
         missed = [m for m in self.measurements if m.over_budget]
         if missed:
@@ -111,7 +112,7 @@ class Report:
             budget = f"{m.budget_ms:.2f}" if m.budget_ms else "—"
             rows.append(
                 f"| {m.name} — *{m.unit}* | {m.median_ms:.4f} | {m.p99_ms:.4f} "
-                f"| {budget} | {m.headroom} |"
+                f"| {budget} | {m.headroom}{(' — ' + m.note) if m.note else ''} |"
             )
         rows += ["", "Budgets come from NFR-1 and NFR-2 in `spec/spec.md`."]
         missed = [m for m in self.measurements if m.over_budget]

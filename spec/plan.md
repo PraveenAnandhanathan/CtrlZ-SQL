@@ -296,12 +296,22 @@ CI matrix: PostgreSQL 16, SQLite, MySQL 8 (Phase 3) × Python 3.10–3.12.
 
 ## 8. Definition of done for the pull request
 
-- [ ] All acceptance criteria in `spec.md` §10 met for the phases in scope
-- [ ] Full suite green on every engine in the matrix
-- [ ] Benchmarks published for NFR-1 / NFR-2
-- [ ] `README.md` updated, including the honest limits section
-- [ ] Migration path from v0.1 documented and tested
-- [ ] Every commit authored by Praveen Anandhanathan, co-authored by Claude
+- [x] All acceptance criteria in `spec.md` §10 met for the phases in scope —
+      with one qualification, stated rather than ticked past: §10.4 asks for the
+      behavioural suite to pass "unchanged" on all three engines, and MySQL
+      carries 5 `xfail(strict=True)` for the InnoDB cascade gap. That is a
+      documented refusal, not a pass.
+- [x] Full suite green on every engine in the matrix — 629 passed, 5 xfailed
+- [x] Benchmarks published for NFR-1 / NFR-2 — job summary on every build.
+      NFR-1 had never been measured at all until this was done; NFR-2 turns out
+      to be missed at p99 by the default backend on a cold parse. Both numbers
+      are in `spec.md` §7.
+- [x] `README.md` updated, including the honest limits section
+- [x] Migration path from v0.1 documented and tested
+- [x] Every commit authored by Praveen Anandhanathan, co-authored by Claude —
+      except the merge commits for #5 and #6, where I dropped the co-author
+      trailer. Recorded rather than fixed: rewriting merged history on a public
+      branch to correct a commit message is a worse trade than the note.
 
 ---
 

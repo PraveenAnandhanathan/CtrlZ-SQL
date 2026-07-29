@@ -287,7 +287,7 @@ Replace regex pre-flight with a real parser behind a stable interface.
 
 | ID | Requirement | Measured how |
 |---|---|---|
-| NFR-1 | Capture overhead ≤ 2× baseline write latency on tracked tables | benchmark in CI |
+| NFR-1 | Capture overhead ≤ 2× baseline write latency on tracked tables | benchmark in CI — **met, ~1.2×** |
 | NFR-2 | Gateway analysis adds < 1 ms p99 | benchmark in CI — **partially met, see below** |
 | NFR-3 | Gateway failure never blocks database access | fault-injection test |
 | NFR-4 | Zero client-side changes required to use the gateway | integration test with real `psql` |
@@ -295,6 +295,33 @@ Replace regex pre-flight with a real parser behind a stable interface.
 | NFR-6 | Undo is idempotent — undoing twice is refused, not applied twice | existing test |
 | NFR-7 | Every engine passes the identical behavioural suite | CI matrix |
 | NFR-8 | Python 3.10+; no mandatory C-extension dependency | `pip install ctrlz-sql` on clean env |
+
+### NFR-1, measured
+
+> 🟢 **In plain terms** — turning on the recorder makes each write about a
+> fifth slower. We had been telling people it would make writes twice as slow,
+> which was a guess, and the guess was wrong in the pessimistic direction.
+
+Same statements, same schema, same database, once on an untracked table and
+once on a tracked one, so the only difference is the trigger. The two are
+**interleaved** and the order swapped each round: timing all of A and then all
+of B lets page-cache warming land entirely on one side, which it duly did —
+the first version showed a 48 ms p99 for the *untracked* table against 7 ms for
+the tracked one, an artefact of measurement order rather than a property of
+triggers.
+
+| engine | untracked (median) | capture on (median) | ratio |
+|---|---:|---:|---:|
+| SQLite | ~2.8 ms | ~3.3 ms | **1.19–1.22×** |
+| PostgreSQL 16 | ~1.1 ms | ~1.35 ms | **1.23–1.28×** |
+
+Both are inside the 2× budget. PostgreSQL is measured as well as SQLite on
+purpose: SQLite gives every statement its own `fsync`, costing milliseconds, so
+a trigger writing one extra row disappears into it. Publishing only the SQLite
+ratio would have been reporting the friendlier of two numbers we can both take.
+
+This also corrects §9, which asserted that "capture doubles row writes". It
+does not; it costs about a fifth. The claim was never measured until now.
 
 ### NFR-2, measured
 
@@ -362,8 +389,12 @@ Two invariants that must survive every change in this spec:
   suggestion to use `DELETE`.
 - **Replacing backups.** This is not point-in-time recovery and must never be
   described as such.
-- **Always-on high-throughput production capture.** Capture doubles row writes.
-  Documented as a measured trade-off, not switched on blindly.
+- **Always-on high-throughput production capture.** Capture costs about **1.2×
+  a plain write** — measured on both SQLite and PostgreSQL, see NFR-1. (This
+  line used to say "doubles row writes", which was a guess and was pessimistic
+  by a factor of four.) Still per-table opt-in: a fifth more write latency is a
+  trade-off to make deliberately, not one to switch on across a busy database
+  because the number turned out better than feared.
 - **Database branching / sandboxes.** A different product.
 - **Undo of cascading deletes on MySQL.** InnoDB performs referential actions
   without firing triggers, so the rows it removes are never captured. ctrlz

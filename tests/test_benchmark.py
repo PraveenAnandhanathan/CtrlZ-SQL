@@ -164,3 +164,170 @@ def test_repeated_statements_are_cheap(benchmark):
         [repeat * 1000] * 3, budget_ms=BUDGET_MS,
     )
     assert repeat < first, f"cached lookup ({repeat*1000:.4f} ms) not faster than first"
+
+
+# -- NFR-1: what capture costs a write -------------------------------------
+
+
+def write_cycle(execute, table: str, index: int) -> list[float]:
+    """Time one insert/update/delete against `table`."""
+    timings = []
+    for sql in (
+        f"INSERT INTO {table} (id, name, salary) VALUES ({index}, 'n', 1)",
+        f"UPDATE {table} SET salary = 2 WHERE id = {index}",
+        f"DELETE FROM {table} WHERE id = {index}",
+    ):
+        start = time.perf_counter()
+        execute(sql)
+        timings.append((time.perf_counter() - start) * 1000)
+    return timings
+
+
+def compare_writes(execute, rounds: int = 120) -> tuple[list[float], list[float]]:
+    """Time both tables interleaved, a round each, alternating which goes first.
+
+    Timing all of A and then all of B lets anything that drifts during the run
+    -- page cache warming, a busy disk, CPU frequency -- land entirely on one
+    side of the comparison. Measured that way here, the *untracked* table
+    showed a 48 ms p99 against the tracked table's 7 ms, which is not a real
+    property of triggers; it is the first run paying for a cold cache.
+
+    Interleaving cancels drift, and swapping the order each round stops the
+    table that goes first from systematically absorbing the flush.
+    """
+    baseline: list[float] = []
+    captured: list[float] = []
+    for index in range(rounds):
+        if index % 2:
+            baseline += write_cycle(execute, "plain", index)
+            captured += write_cycle(execute, "watched", index)
+        else:
+            captured += write_cycle(execute, "watched", index)
+            baseline += write_cycle(execute, "plain", index)
+    return baseline, captured
+
+
+def test_capture_overhead_is_measured_not_assumed(tmp_path, benchmark):
+    """NFR-1: capture overhead <= 2x baseline write latency.
+
+    This was in the plan's definition of done and had never been measured --
+    the benchmarks covered NFR-2 alone. The spec's non-goals say plainly that
+    "capture doubles row writes", which is the single number somebody weighing
+    whether to switch this on actually needs, and it was an assertion rather
+    than a measurement.
+
+    The comparison is the same statements against the same schema in the same
+    database, once on an untracked table and once on a tracked one, so the only
+    difference between the two numbers is the trigger.
+    """
+    import sqlite3
+
+    import ctrlz
+
+    path = tmp_path / "overhead.db"
+    tk = ctrlz.connect(f"sqlite:///{path}")
+    columns = "(id INTEGER PRIMARY KEY, name TEXT, salary REAL)"
+    tk.engine.conn.executescript(
+        f"CREATE TABLE plain {columns}; CREATE TABLE watched {columns};"
+    )
+    tk.init()
+    tk.track("watched")
+
+    execute = tk.engine.conn.execute
+    compare_writes(execute, rounds=20)                # warm up both tables
+
+    baseline, captured = compare_writes(execute)
+
+    benchmark.record(
+        "write, untracked", "one INSERT/UPDATE/DELETE (SQLite)", baseline
+    )
+    recorded = benchmark.record(
+        "write, capture on", "the same statement with a trigger", captured
+    )
+
+    overhead = statistics.median(captured) / statistics.median(baseline)
+    recorded.note = f"{overhead:.2f}x baseline"
+
+    # Deliberately loose, like the rest of this file: shared CI hardware makes
+    # a tight ratio a flaky test, and a flaky test gets deleted. NFR-1's real
+    # value is the published number, not this tripwire.
+    assert overhead < 6, (
+        f"capture costs {overhead:.2f}x a plain write -- NFR-1 budgets 2x, and "
+        f"this is far enough past it to be a defect rather than noise"
+    )
+
+    # Capture must actually have happened, or the comparison measured nothing.
+    assert tk.log(limit=5), "no operations recorded: the trigger did not fire"
+    tk.close()
+
+
+def test_capture_overhead_on_postgres(benchmark):
+    """The same measurement where it actually matters.
+
+    SQLite's number flatters capture: every statement is its own autocommit
+    with an fsync costing milliseconds, so a trigger writing one extra row
+    disappears into it. PostgreSQL's baseline write is far cheaper, which
+    makes the *relative* cost of capture higher -- and PostgreSQL is the
+    primary target. Publishing only the SQLite ratio would be reporting the
+    friendlier of two numbers we can both measure.
+    """
+    import os
+    import uuid
+
+    dsn = os.environ.get("CTRLZ_TEST_PG_DSN")
+    from .conftest import require
+
+    require("postgres", dsn, "CTRLZ_TEST_PG_DSN")
+
+    import psycopg2
+
+    import ctrlz
+
+    schema = f"bench_{uuid.uuid4().hex[:8]}"
+    admin = psycopg2.connect(dsn)
+    admin.autocommit = True
+    columns = "(id int PRIMARY KEY, name text, salary numeric)"
+    with admin.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA {schema}")
+        cur.execute(f"CREATE TABLE {schema}.plain {columns}")
+        cur.execute(f"CREATE TABLE {schema}.watched {columns}")
+
+    tk = ctrlz.connect(dsn)
+    tk.engine.default_schema = schema
+    tk.init()
+    tk.track(f"{schema}.watched")
+
+    cursor = tk.engine.conn.cursor()
+
+    def execute(sql: str) -> None:
+        cursor.execute(sql.replace(" plain", f" {schema}.plain")
+                          .replace(" watched", f" {schema}.watched"))
+        tk.engine.conn.commit()
+
+    try:
+        compare_writes(execute, rounds=20)            # warm up
+        baseline, captured = compare_writes(execute, rounds=80)
+
+        benchmark.record(
+            "write, untracked (pg)", "one INSERT/UPDATE/DELETE (PostgreSQL)",
+            baseline,
+        )
+        recorded = benchmark.record(
+            "write, capture on (pg)", "the same statement with a trigger",
+            captured,
+        )
+        overhead = statistics.median(captured) / statistics.median(baseline)
+        recorded.note = f"{overhead:.2f}x baseline"
+
+        assert overhead < 6, (
+            f"capture costs {overhead:.2f}x a plain write on PostgreSQL -- "
+            f"NFR-1 budgets 2x"
+        )
+        assert tk.log(limit=5), "no operations recorded: the trigger did not fire"
+    finally:
+        cursor.close()
+        tk.close()
+        with admin.cursor() as cur:
+            cur.execute(f"DROP SCHEMA {schema} CASCADE")
+            cur.execute("DROP SCHEMA IF EXISTS ctrlz CASCADE")
+        admin.close()
