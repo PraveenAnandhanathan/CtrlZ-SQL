@@ -940,6 +940,22 @@ class PostgresEngine(Engine):
                     fixed.append(f"{qualified}.{r['name']}")
         return fixed
 
+    # -- settings ----------------------------------------------------------
+
+    def get_setting(self, key: str) -> Optional[str]:
+        self._require_init()
+        row = self._one("SELECT value FROM ctrlz.settings WHERE key = %s", (key,))
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._require_init()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ctrlz.settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, value),
+            )
+
     # -- retention ---------------------------------------------------------
 
     def purge(self, older_than_seconds: Optional[int] = None) -> int:

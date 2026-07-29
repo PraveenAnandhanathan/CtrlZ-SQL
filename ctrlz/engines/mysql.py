@@ -964,6 +964,21 @@ class MySQLEngine(Engine):
         image = self._image_expression(change.table_name, "")
         return f" AND {image} = CAST(%s AS JSON)", [stored]
 
+    # -- settings ----------------------------------------------------------
+
+    def get_setting(self, key: str) -> Optional[str]:
+        self._require_init()
+        row = self._one("SELECT `value` FROM ctrlz_settings WHERE `key` = %s", (key,))
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._require_init()
+        self._exec(
+            "INSERT INTO ctrlz_settings (`key`, `value`) VALUES (%s, %s) "
+            "ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+            (key, value),
+        )
+
     # -- retention ---------------------------------------------------------
 
     def purge(self, older_than_seconds: Optional[int] = None) -> int:
