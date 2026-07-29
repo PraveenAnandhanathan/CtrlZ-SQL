@@ -11,7 +11,7 @@ from ctrlz.model import CLEAN, DRIFTED, MISSING, OCCUPIED
 
 from .conftest import bare_names, raw_execute, raw_insert_with_id, rows
 
-ENGINES = ["sqlite_db", "pg_db"]
+ENGINES = ["sqlite_db", "pg_db", "mysql_db"]
 
 
 @pytest.fixture(params=ENGINES)

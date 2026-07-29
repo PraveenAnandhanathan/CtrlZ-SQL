@@ -25,10 +25,12 @@ dependencies = [
 [project.optional-dependencies]
 postgres = ["psycopg2-binary>=2.9"]
 pg-parser = ["pglast>=6"]
+mysql = ["PyMySQL>=1.1"]
 dev = [
     "psycopg2-binary>=2.9",
     "psycopg[binary]>=3.1",
     "pglast>=6",
+    "PyMySQL>=1.1",
     "sqlalchemy>=2",
     "pytest>=7",
 ]
