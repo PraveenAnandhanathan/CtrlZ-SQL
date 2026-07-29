@@ -9,10 +9,11 @@ import sys
 from typing import Optional
 
 from . import render
+from .actor import CLI, Actor
 from .api import DEFAULT_CONFIRM_OVER, Toolkit, connect
 from .errors import CtrlzError, NoIdentity, PreflightBlocked
 from .model import ACTION_NAMES
-from .preflight import inspect as preflight_inspect
+from .policy import find_policy_file, load_policy
 
 PROG = "ctrlz"
 
@@ -89,6 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("check", help="run the guardrails over a statement without executing")
     p.add_argument("sql")
+    p.add_argument("--explain", action="store_true", help="show how the verdict was reached")
+
+    p = sub.add_parser("policy", help="inspect the rulebook")
+    p.add_argument(
+        "action",
+        nargs="?",
+        default="show",
+        choices=("show", "test", "lint", "path"),
+        help="show the effective rules, test a statement, validate the file, "
+        "or print where it was loaded from",
+    )
+    p.add_argument("sql", nargs="?", help="statement to test (for: policy test)")
+    p.add_argument("--file", help="policy file to use instead of the discovered one")
 
     p = sub.add_parser("purge", help="delete old history")
     p.add_argument("--older-than", help="e.g. 30m, 24h, 7d; omit to delete everything")
@@ -102,7 +116,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        with connect(args.dsn) as toolkit:
+        with connect(args.dsn, actor=Actor.resolve(channel=CLI)) as toolkit:
             return dispatch(toolkit, args)
     except PreflightBlocked as exc:
         print(render.c("Blocked by a guardrail:", "red"), file=sys.stderr)
@@ -225,7 +239,8 @@ def cmd_run(toolkit: Toolkit, args) -> int:
             "rowcount": result.rowcount,
             "committed": result.committed,
             "warnings": result.warnings,
-        }, indent=2))
+            "decision": _decision_json(result.decision) if result.decision else None,
+        }, indent=2, default=str))
         return 0
 
     for warning in result.warnings:
@@ -301,23 +316,120 @@ def cmd_redo(toolkit: Toolkit, args) -> int:
     return 0
 
 
+#: Exit codes, so scripts and CI can act on a verdict without parsing text.
+EXIT_ALLOW, EXIT_WARN, EXIT_BLOCK = 0, 1, 2
+
+
+def _exit_code(decision) -> int:
+    return {"allow": EXIT_ALLOW, "warn": EXIT_WARN, "block": EXIT_BLOCK}[decision.outcome]
+
+
 def cmd_check(toolkit: Toolkit, args) -> int:
-    tracked = {name for name, _ in toolkit.tracked()}
-    checks = preflight_inspect(args.sql, tracked=tracked)
+    decision = toolkit.check(args.sql)
+    if args.json:
+        print(json.dumps(_decision_json(decision), indent=2))
+        return _exit_code(decision)
+
+    print(render.format_decision(decision))
+    if getattr(args, "explain", False):
+        print()
+        print(render.c(decision.explain(), "dim"))
+    return _exit_code(decision)
+
+
+def cmd_policy(toolkit: Toolkit, args) -> int:
+    handlers = {
+        "show": _policy_show,
+        "test": _policy_test,
+        "lint": _policy_lint,
+        "path": _policy_path,
+    }
+    return handlers[args.action](toolkit, args)
+
+
+def _policy_for(toolkit: Toolkit, args):
+    return load_policy(args.file) if getattr(args, "file", None) else toolkit.policy
+
+
+def _policy_show(toolkit: Toolkit, args) -> int:
+    policy = _policy_for(toolkit, args)
     if args.json:
         print(json.dumps({
-            "keyword": checks.keyword,
-            "blockers": checks.blockers,
-            "warnings": checks.warnings,
+            "source": policy.source,
+            "risk_threshold": policy.risk_threshold,
+            "block_on_risk": policy.block_on_risk,
+            "rules": [
+                {"name": r.name, "action": r.action, "risk": r.risk, "message": r.message}
+                for r in policy.rules
+            ],
         }, indent=2))
-        return 2 if checks.blocked else 0
-    for blocker in checks.blockers:
-        print(render.c(f"blocked: {blocker}", "red"))
-    for warning in checks.warnings:
-        print(render.c(f"warning: {warning}", "yellow"))
-    if not checks.blockers and not checks.warnings:
-        print(render.c("Looks fine.", "green"))
-    return 2 if checks.blocked else 0
+        return 0
+
+    print(render.c(f"loaded from {policy.source}", "dim"))
+    print(
+        f"risk threshold: {policy.risk_threshold}   "
+        f"block on risk: {'yes' if policy.block_on_risk else 'no'}"
+    )
+    if not policy.block_on_risk:
+        print(render.c(
+            "  a high score warns but does not refuse; set block_on_risk to change that",
+            "dim",
+        ))
+    print()
+    rows = [
+        [
+            render.c(rule.name, "bold"),
+            render.c(rule.action, {"block": "red", "warn": "yellow"}.get(rule.action, "dim")),
+            str(rule.risk),
+            render.truncate(rule.message, 66),
+        ]
+        for rule in policy.rules
+    ]
+    print(render.table(rows, ["RULE", "ACTION", "RISK", "MESSAGE"]))
+    return 0
+
+
+def _policy_test(toolkit: Toolkit, args) -> int:
+    if not args.sql:
+        print(f"{PROG}: policy test needs a statement", file=sys.stderr)
+        return 1
+    from .policy import PolicyEngine
+
+    engine = PolicyEngine(_policy_for(toolkit, args))
+    decision = engine.evaluate_sql(args.sql, context=toolkit._context())
+    if args.json:
+        print(json.dumps(_decision_json(decision), indent=2))
+        return _exit_code(decision)
+    print(render.format_decision(decision))
+    print()
+    print(render.c(decision.explain(), "dim"))
+    return _exit_code(decision)
+
+
+def _policy_lint(toolkit: Toolkit, args) -> int:
+    """Validate a policy file. Loading it *is* the validation -- the loader
+    rejects anything it cannot make sense of."""
+    policy = _policy_for(toolkit, args)
+    print(
+        render.c("Policy is valid.", "green")
+        + f" {len(policy.rules)} rule(s) from {policy.source}."
+    )
+    return 0
+
+
+def _policy_path(toolkit: Toolkit, args) -> int:
+    found = find_policy_file()
+    if args.json:
+        print(json.dumps({"path": str(found) if found else None,
+                          "source": toolkit.policy.source}, indent=2))
+        return 0
+    if found:
+        print(found)
+    else:
+        print(render.c("No ctrlz.policy.yaml found; using the built-in defaults.", "dim"))
+        print(render.c("Create one to write your own rules: ctrlz policy show > "
+                       "ctrlz.policy.yaml", "dim"))
+    return 0
 
 
 def cmd_purge(toolkit: Toolkit, args) -> int:
@@ -338,12 +450,18 @@ def cmd_doctor(toolkit: Toolkit, args) -> int:
 
     print(f"engine:      {info['engine']}")
     print(f"initialized: {'yes' if info['initialized'] else 'no'}")
+    print(f"actor:       {info['actor']}  (environment: {info['environment']})")
+    print(
+        f"policy:      {info['policy_rules']} rule(s) from {info['policy_source']}; "
+        f"block on risk: {'yes' if info['block_on_risk'] else 'no'}"
+    )
     if not info["initialized"]:
         print(render.c("\nRun: ctrlz init", "yellow"))
         return 1
 
     tracked = info.get("tracked") or []
     untracked = info.get("untracked") or []
+    print(f"schema:      v{info.get('schema_version', '?')}")
     print(f"operations:  {info.get('operations', 0)} in history")
     print(f"\n{render.c('Protected', 'green')} ({len(tracked)} table(s))")
     for name, ident in tracked:
@@ -380,12 +498,45 @@ def _emit(args, payload: dict, human) -> None:
         human()
 
 
+def _decision_json(decision) -> dict:
+    analysis = decision.analysis
+    return {
+        "outcome": decision.outcome,
+        "risk": decision.risk,
+        "risk_threshold": decision.risk_threshold,
+        "block_on_risk": decision.block_on_risk,
+        "decided_by": decision.decided_by.name if decision.decided_by else None,
+        "scored_by": decision.scored_by.name if decision.scored_by else None,
+        "matched": [
+            {"rule": m.name, "action": m.rule.action, "risk": m.rule.risk,
+             "message": m.message}
+            for m in decision.matched
+        ],
+        "analysis": {
+            "statement": analysis.statement,
+            "kind": analysis.kind,
+            "written_tables": list(analysis.written_tables),
+            "read_tables": list(analysis.read_tables),
+            "has_filter": analysis.has_filter,
+            "confidence": analysis.confidence,
+            "backend": analysis.backend,
+            "notes": list(analysis.notes),
+        },
+    }
+
+
 def _op_json(op) -> dict:
     return {
         "op_id": op.op_id,
         "label": op.label,
         "source": op.source,
         "actor": op.actor,
+        "actor_user": op.actor_user,
+        "actor_host": op.actor_host,
+        "ticket": op.ticket,
+        "channel": op.channel,
+        "risk": op.risk,
+        "policy_outcome": op.policy_outcome,
         "started_at": op.started_at,
         "row_count": op.row_count,
         "capped": op.capped,

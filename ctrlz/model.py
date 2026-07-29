@@ -64,6 +64,27 @@ class Operation:
     undone_by: Optional[str] = None
     tables: list[str] = field(default_factory=list)
 
+    # Attribution and the guardrail verdict, added in schema v2. All optional:
+    # operations captured before the upgrade, or by a client that set nothing,
+    # genuinely have no actor. NULL is the honest answer in an audit trail.
+    actor_user: Optional[str] = None
+    actor_host: Optional[str] = None
+    actor_app: Optional[str] = None
+    ticket: Optional[str] = None
+    channel: Optional[str] = None
+    risk: Optional[int] = None
+    policy_outcome: Optional[str] = None
+
+    @property
+    def who(self) -> str:
+        """The human behind this, falling back to the database role."""
+        return self.actor_user or self.actor or "unknown"
+
+    @property
+    def where_from(self) -> str:
+        parts = [p for p in (self.actor_host, self.actor_app, self.channel) if p]
+        return " / ".join(parts)
+
     @property
     def is_undo(self) -> bool:
         return self.undo_of is not None
@@ -142,3 +163,6 @@ class ExecutionResult:
     rowcount: int
     committed: bool
     warnings: list[str] = field(default_factory=list)
+    #: The policy verdict that let this run. Typed as Any so the model layer
+    #: stays free of any dependency on the policy package.
+    decision: Any = None

@@ -1,0 +1,276 @@
+# Differential corpus for the analysis layer (task T6).
+#
+# Every installed backend runs every statement here. Parsing backends (sqlglot,
+# pglast) must agree with the expectations exactly. The regex backend is held to
+# a lower bar, because pattern matching genuinely cannot answer some of these --
+# where it differs, the difference is written down with a reason rather than
+# quietly tolerated.
+#
+# Fields:
+#   sql             the statement
+#   statement       expected statement class
+#   has_filter      does a row-restricting predicate exist on the write itself
+#   written_tables  tables the statement writes to (order-insensitive)
+#   read_tables     optional; tables it only reads
+#   tautology       optional; the filter matches everything anyway
+#   regex           optional; expected regex-backend divergence
+#   reason          required whenever `regex` is present
+
+# -- the statement everyone is afraid of -----------------------------------
+
+- sql: "UPDATE users SET salary = 0"
+  statement: UPDATE
+  has_filter: false
+  written_tables: [users]
+
+- sql: "DELETE FROM users"
+  statement: DELETE
+  has_filter: false
+  written_tables: [users]
+
+- sql: "DELETE FROM public.users"
+  statement: DELETE
+  has_filter: false
+  written_tables: [public.users]
+
+- sql: "UPDATE public.users SET salary = 0 WHERE id = 1"
+  statement: UPDATE
+  has_filter: true
+  written_tables: [public.users]
+
+- sql: "DELETE FROM ONLY users WHERE id = 1"
+  statement: DELETE
+  has_filter: true
+  written_tables: [users]
+
+# -- filters that do not filter --------------------------------------------
+
+- sql: "UPDATE users SET salary = 0 WHERE 1 = 1"
+  statement: UPDATE
+  has_filter: true
+  written_tables: [users]
+  tautology: true
+
+- sql: "DELETE FROM users WHERE true"
+  statement: DELETE
+  has_filter: true
+  written_tables: [users]
+  tautology: true
+
+- sql: "UPDATE users SET salary = 0 WHERE 1 = 1 AND id = 5"
+  statement: UPDATE
+  has_filter: true
+  written_tables: [users]
+  tautology: false
+
+# -- a WHERE that belongs to something else --------------------------------
+# The single most valuable thing real parsing buys us: a subquery's WHERE
+# restricts the subquery, not the rows being written.
+
+- sql: "DELETE FROM audit USING (SELECT id FROM staging WHERE ok) q"
+  statement: DELETE
+  has_filter: false
+  written_tables: [audit]
+  read_tables: [staging]
+  reason: >-
+    this removes every row of audit -- the WHERE restricts the USING subquery,
+    not the delete. All three backends now read it correctly; the fallback does
+    so by ignoring any WHERE nested inside parentheses.
+
+- sql: "UPDATE totals SET n = (SELECT count(*) FROM orders WHERE paid)"
+  statement: UPDATE
+  has_filter: false
+  written_tables: [totals]
+  read_tables: [orders]
+  reason: >-
+    the WHERE belongs to the scalar subquery; the UPDATE itself is unfiltered
+    and rewrites every row of totals.
+
+- sql: "DELETE FROM orders WHERE id IN (SELECT id FROM stale)"
+  statement: DELETE
+  has_filter: true
+  written_tables: [orders]
+  read_tables: [stale]
+
+# -- write target vs read source -------------------------------------------
+
+- sql: "UPDATE users u SET dept = d.name FROM depts d WHERE u.dept_id = d.id"
+  statement: UPDATE
+  has_filter: true
+  written_tables: [users]
+  read_tables: [depts]
+
+- sql: "DELETE FROM a USING b WHERE a.id = b.id"
+  statement: DELETE
+  has_filter: true
+  written_tables: [a]
+  read_tables: [b]
+
+- sql: "INSERT INTO archive SELECT * FROM orders WHERE created_at < '2020-01-01'"
+  statement: INSERT
+  has_filter: false
+  written_tables: [archive]
+  read_tables: [orders]
+
+- sql: "INSERT INTO users (name, salary) VALUES ('ada', 1)"
+  statement: INSERT
+  has_filter: false
+  written_tables: [users]
+
+- sql: "INSERT INTO users (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = 'b'"
+  statement: INSERT
+  has_filter: false
+  written_tables: [users]
+
+# -- CTEs -------------------------------------------------------------------
+
+- sql: "WITH doomed AS (SELECT id FROM users WHERE inactive) DELETE FROM users WHERE id IN (SELECT id FROM doomed)"
+  statement: DELETE
+  has_filter: true
+  written_tables: [users]
+
+- sql: "WITH src AS (SELECT 1 AS x) INSERT INTO t (x) SELECT x FROM src"
+  statement: INSERT
+  has_filter: false
+  written_tables: [t]
+
+# -- merge ------------------------------------------------------------------
+
+- sql: "MERGE INTO target t USING source s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = s.x"
+  statement: MERGE
+  has_filter: false
+  written_tables: [target]
+  read_tables: [source]
+
+# -- reads ------------------------------------------------------------------
+
+- sql: "SELECT * FROM users"
+  statement: SELECT
+  has_filter: false
+  written_tables: []
+
+- sql: "SELECT * FROM users WHERE id = 1"
+  statement: SELECT
+  has_filter: false
+  written_tables: []
+  reason: >-
+    has_filter is only meaningful for statements that write. A SELECT is never
+    dangerous for the absence of a WHERE.
+
+- sql: "SELECT u.*, d.name FROM users u JOIN depts d ON d.id = u.dept_id"
+  statement: SELECT
+  has_filter: false
+  written_tables: []
+
+# -- DDL --------------------------------------------------------------------
+
+- sql: "TRUNCATE TABLE users"
+  statement: TRUNCATE
+  has_filter: false
+  written_tables: [users]
+
+- sql: "TRUNCATE users"
+  statement: TRUNCATE
+  has_filter: false
+  written_tables: [users]
+
+- sql: "DROP TABLE public.users"
+  statement: DROP
+  has_filter: false
+  written_tables: [public.users]
+
+- sql: "ALTER TABLE users DROP COLUMN salary"
+  statement: ALTER
+  has_filter: false
+  written_tables: [users]
+
+- sql: "ALTER TABLE users ADD COLUMN nickname text"
+  statement: ALTER
+  has_filter: false
+  written_tables: [users]
+
+- sql: "CREATE TABLE t (id int PRIMARY KEY)"
+  statement: CREATE
+  has_filter: false
+  written_tables: [t]
+
+# -- quoting and casing -----------------------------------------------------
+
+- sql: "update USERS set SALARY = 1 where ID = 2"
+  statement: UPDATE
+  has_filter: true
+  written_tables: [USERS]
+
+- sql: "DELETE FROM \"users\" WHERE \"id\" = 1"
+  statement: DELETE
+  has_filter: true
+  written_tables: [users]
+  regex: {written_tables: []}
+  reason: >-
+    quoted identifiers are blanked during normalisation, so the fallback cannot
+    name the target. It reports no table rather than a wrong one.
+
+# -- comments and literals that look like SQL -------------------------------
+
+- sql: "DELETE FROM logs -- WHERE id = 1"
+  statement: DELETE
+  has_filter: false
+  written_tables: [logs]
+
+- sql: "DELETE FROM logs /* WHERE id = 1 */"
+  statement: DELETE
+  has_filter: false
+  written_tables: [logs]
+
+- sql: "UPDATE t SET note = 'delete from users where 1=1'"
+  statement: UPDATE
+  has_filter: false
+  written_tables: [t]
+
+- sql: "UPDATE t SET note = 'no WHERE here' WHERE id = 1"
+  statement: UPDATE
+  has_filter: true
+  written_tables: [t]
+
+- sql: "DELETE FROM t WHERE name = 'O''Brien'"
+  statement: DELETE
+  has_filter: true
+  written_tables: [t]
+
+# -- returning --------------------------------------------------------------
+
+- sql: "DELETE FROM users WHERE id = 1 RETURNING *"
+  statement: DELETE
+  has_filter: true
+  written_tables: [users]
+
+- sql: "UPDATE users SET salary = 1 RETURNING id"
+  statement: UPDATE
+  has_filter: false
+  written_tables: [users]
+
+# -- multi-column and expression assignments --------------------------------
+
+- sql: "UPDATE users SET salary = salary * 2, bonus = 0 WHERE dept = 'IT'"
+  statement: UPDATE
+  has_filter: true
+  written_tables: [users]
+
+- sql: "UPDATE users SET (salary, bonus) = (1, 2) WHERE id = 3"
+  statement: UPDATE
+  has_filter: true
+  written_tables: [users]
+
+# -- what pattern matching still cannot do ----------------------------------
+
+- sql: 'DELETE FROM "user data" WHERE id = 1'
+  statement: DELETE
+  has_filter: true
+  written_tables: ["user data"]
+  regex: {written_tables: []}
+  reason: >-
+    normalisation blanks quoted identifiers before matching, so the fallback
+    cannot recover a table name containing a space. It still correctly sees a
+    filtered DELETE; it just cannot say what is being deleted from. This is the
+    shape of every regex limitation -- less information, never wrong
+    information.

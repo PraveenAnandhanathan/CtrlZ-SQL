@@ -17,17 +17,24 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Database",
 ]
-dependencies = []
+dependencies = [
+    "sqlglot>=25",
+    "PyYAML>=6",
+]
 
 [project.optional-dependencies]
 postgres = ["psycopg2-binary>=2.9"]
-dev = ["psycopg2-binary>=2.9", "pytest>=7"]
+pg-parser = ["pglast>=6"]
+dev = ["psycopg2-binary>=2.9", "pglast>=6", "pytest>=7"]
 
 [project.scripts]
 ctrlz = "ctrlz.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ctrlz*"]
+
+[tool.setuptools.package-data]
+ctrlz = ["policy/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

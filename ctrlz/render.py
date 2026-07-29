@@ -115,11 +115,91 @@ def format_operations(ops: Iterable[Operation]) -> str:
                 ago(op.started_at),
                 c(mark, colour),
                 str(op.row_count),
+                format_risk(op),
+                truncate(op.who, 16),
                 ", ".join(op.tables) or "-",
-                truncate(op.label or "(unlabelled)", 44),
+                truncate(op.label or "(unlabelled)", 40),
             ]
         )
-    return table(rows, ["ID", "WHEN", "STATE", "ROWS", "TABLES", "LABEL"])
+    return table(
+        rows, ["ID", "WHEN", "STATE", "ROWS", "RISK", "ACTOR", "TABLES", "LABEL"]
+    )
+
+
+def format_risk(op) -> str:
+    """A compact risk cell: the number, coloured by how it was treated."""
+    if op.risk is None:
+        return c("-", "dim")
+    colour = {"forced": "red", "block": "red", "warn": "yellow"}.get(
+        op.policy_outcome or "", "dim" if op.risk == 0 else "green"
+    )
+    label = str(op.risk)
+    if op.policy_outcome == "forced":
+        label += "!"
+    return c(label, colour)
+
+
+# -- policy decisions ------------------------------------------------------
+
+
+def format_decision(decision, show_analysis: bool = True) -> str:
+    """Explain a policy verdict, including how the statement was read."""
+    analysis = decision.analysis
+    lines: list[str] = []
+
+    if show_analysis:
+        target = ", ".join(analysis.written_tables) or "-"
+        lines.append(
+            f"{c(analysis.statement, 'bold')}  {target}   "
+            + c(
+                f"read by {analysis.backend} "
+                f"(confidence {analysis.confidence:.2f})",
+                "dim",
+            )
+        )
+        for note in analysis.notes:
+            lines.append(c(f"  note: {note}", "dim"))
+        lines.append("")
+
+    for match in decision.matched:
+        colour = {"block": "red", "warn": "yellow"}.get(match.rule.action, "dim")
+        lines.append(f"  {c('[' + match.rule.action + ']', colour)} {c(match.name, 'bold')}")
+        lines.append(f"      {match.message}")
+    if decision.matched:
+        lines.append("")
+
+    lines.append(format_decision_banner(decision))
+    return "\n".join(lines)
+
+
+def format_decision_banner(decision) -> str:
+    outcome = decision.outcome
+    if outcome == "block":
+        head = c("BLOCKED", "red")
+    elif outcome == "warn":
+        head = c("ALLOWED WITH WARNINGS", "yellow")
+    else:
+        head = c("ALLOWED", "green")
+
+    text = f"{head}  risk {decision.risk}/{decision.risk_threshold}"
+    detail = []
+    if decision.decided_by:
+        detail.append(f"decided by '{decision.decided_by.name}'")
+    if decision.scored_by and decision.scored_by is not decision.decided_by:
+        detail.append(f"highest risk from '{decision.scored_by.name}'")
+    if detail:
+        text += "\n" + c("  " + ", ".join(detail), "dim")
+    if (
+        decision.risk >= decision.risk_threshold
+        and not decision.block_on_risk
+        and outcome != "block"
+    ):
+        text += "\n" + c(
+            "  risk is at or above the threshold, but block_on_risk is off "
+            "-- this is a warning only",
+            "dim",
+        )
+    return text
 
 
 # -- preview ---------------------------------------------------------------
@@ -137,7 +217,8 @@ def format_preview(assessment: Undoability, max_rows: int = 20) -> str:
     lines.append(
         c(
             f"  {op.row_count} row(s) across {', '.join(op.tables) or 'no tables'} "
-            f"by {op.actor} {ago(op.started_at)} via {op.source}",
+            f"by {op.who} {ago(op.started_at)} via {op.source}"
+            + (f" [{op.ticket}]" if op.ticket else ""),
             "dim",
         )
     )

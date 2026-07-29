@@ -1,49 +1,39 @@
-"""Guardrails that run *before* a statement executes.
+"""Deprecated. Use :mod:`ctrlz.analysis` and :mod:`ctrlz.policy` instead.
 
-Important: nothing in this module is load-bearing for undo correctness. Undo is
-built from row images captured by the database itself, never from parsing SQL.
-These checks are a seatbelt -- a fast, deliberately shallow look at the text to
-catch the classic "I forgot the WHERE clause" mistake before it happens. A
-false negative here costs nothing, because capture still recorded every row.
+This was the original guardrail: a handful of regular expressions run over a
+statement before it executed. It has been replaced by real parsing behind
+:func:`ctrlz.analysis.analyze`, and by a rulebook that lives in
+``ctrlz.policy.yaml`` rather than in this file.
+
+The module survives as a thin shim so that existing imports keep working. It
+now delegates to the regex analysis backend, which is the same logic in its
+new home, so there is one implementation rather than two drifting copies.
+
+Nothing here was ever load-bearing for undo correctness, and that has not
+changed. Undo is built from row images captured by the database itself.
 """
 
 from __future__ import annotations
 
-import re
+import warnings
 from dataclasses import dataclass, field
 
-# Strip string literals, dollar-quoted bodies, and comments before looking for
-# keywords, so a WHERE inside a string doesn't fool us in either direction.
-_DOLLAR_QUOTED = re.compile(r"\$([A-Za-z_]\w*)?\$.*?\$\1?\$", re.S)
-_LINE_COMMENT = re.compile(r"--[^\n]*")
-_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
-_SINGLE_QUOTED = re.compile(r"'(?:''|[^'])*'", re.S)
-_DOUBLE_QUOTED = re.compile(r'"(?:""|[^"])*"', re.S)
+from .analysis import analyze
+from .analysis.backends.regex_backend import (  # re-exported for compatibility
+    leading_keyword,
+    normalize,
+)
+from .analysis.model import DDL_STATEMENTS, WRITE_STATEMENTS
+from .policy import Context, PolicyEngine
 
-
-def normalize(sql: str) -> str:
-    """Return SQL with comments and quoted text blanked out."""
-    out = _DOLLAR_QUOTED.sub(" ", sql)
-    out = _BLOCK_COMMENT.sub(" ", out)
-    out = _LINE_COMMENT.sub(" ", out)
-    out = _SINGLE_QUOTED.sub(" '' ", out)
-    out = _DOUBLE_QUOTED.sub(" ident ", out)
-    return re.sub(r"\s+", " ", out).strip()
-
-
-def leading_keyword(sql: str) -> str:
-    m = re.match(r"[A-Za-z]+", normalize(sql))
-    return m.group(0).upper() if m else ""
-
-
-def is_dml(sql: str) -> bool:
-    return leading_keyword(sql) in {"INSERT", "UPDATE", "DELETE", "MERGE"}
-
-
-def is_ddl(sql: str) -> bool:
-    return leading_keyword(sql) in {
-        "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT",
-    }
+__all__ = [
+    "Preflight",
+    "inspect",
+    "is_ddl",
+    "is_dml",
+    "leading_keyword",
+    "normalize",
+]
 
 
 @dataclass
@@ -60,67 +50,40 @@ class Preflight:
         return bool(self.blockers)
 
 
+def is_dml(sql: str) -> bool:
+    return analyze(sql).statement in WRITE_STATEMENTS
+
+
+def is_ddl(sql: str) -> bool:
+    return analyze(sql).statement in DDL_STATEMENTS
+
+
 def inspect(sql: str, tracked: set[str] | None = None) -> Preflight:
-    """Look at a statement and report anything alarming about it."""
-    text = normalize(sql)
-    keyword = leading_keyword(sql)
-    pf = Preflight(sql=sql, keyword=keyword)
+    """Look at a statement and report anything alarming about it.
 
-    if keyword in {"UPDATE", "DELETE"} and not re.search(r"\bWHERE\b", text, re.I):
-        pf.blockers.append(
-            f"{keyword} with no WHERE clause -- this touches every row in the table."
-        )
-
-    if keyword == "TRUNCATE":
-        pf.blockers.append(
-            "TRUNCATE does not fire row triggers, so ctrlz cannot capture or "
-            "undo it. Use DELETE if you want an undoable operation."
-        )
-
-    if re.search(r"\bWHERE\s+1\s*=\s*1\b", text, re.I):
-        pf.warnings.append("WHERE 1=1 matches every row.")
-
-    if keyword == "DROP":
-        pf.warnings.append(
-            "DDL is not captured. ctrlz cannot undo this; take a backup first."
-        )
-    elif is_ddl(sql):
-        pf.warnings.append("DDL is not captured. ctrlz cannot undo this statement.")
-
-    if tracked is not None and is_dml(sql):
-        target = _target_table(text)
-        if target and not _matches_tracked(target, tracked):
-            pf.warnings.append(
-                f"{target} does not look tracked -- changes to it will not be undoable. "
-                f"Run: ctrlz track {target}"
-            )
-
-    return pf
-
-
-def _target_table(text: str) -> str | None:
-    """Best-effort extraction of the table a DML statement writes to.
-
-    Only used to warn about untracked tables. Wrong answers here degrade to a
-    missing or spurious warning, never to a wrong undo.
+    Kept for compatibility. New code should call
+    ``ctrlz.policy.evaluate_sql`` (or ``Toolkit.check``), which returns a
+    richer verdict including a risk score and the rule that produced it.
     """
-    patterns = (
-        r"\bUPDATE\s+(?:ONLY\s+)?([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)",
-        r"\bDELETE\s+FROM\s+(?:ONLY\s+)?([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)",
-        r"\bINSERT\s+INTO\s+([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)",
-        r"\bMERGE\s+INTO\s+([A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?)",
+    warnings.warn(
+        "ctrlz.preflight.inspect is deprecated; use ctrlz.policy.evaluate_sql "
+        "or Toolkit.check instead",
+        DeprecationWarning,
+        stacklevel=2,
     )
-    for pat in patterns:
-        m = re.search(pat, text, re.I)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _matches_tracked(target: str, tracked: set[str]) -> bool:
-    target = target.lower()
-    for name in tracked:
-        name = name.lower()
-        if target == name or name.endswith("." + target):
-            return True
-    return False
+    # Deliberately *not* pinned to the regex backend. Pinning it would preserve
+    # the old mechanism at the cost of the old outcome: the shipped rulebook
+    # only blocks an unfiltered write when it is confident in the reading, so a
+    # regex-only verdict downgrades "DELETE FROM users" from blocked to warned.
+    # Callers of this function care whether `blocked` is True, not which parser
+    # decided it, and quietly weakening a safety default for the sake of
+    # fidelity to an implementation detail would be the wrong trade.
+    decision = PolicyEngine().evaluate_sql(
+        sql, context=Context.build(tracked=tracked or ())
+    )
+    return Preflight(
+        sql=sql,
+        keyword=decision.analysis.statement,
+        blockers=list(decision.blockers),
+        warnings=list(decision.warnings),
+    )

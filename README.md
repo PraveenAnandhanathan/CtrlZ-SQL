@@ -87,7 +87,7 @@ Undo is the fallback. The thing that actually saves you is the pre-flight:
 ```console
 $ ctrlz run "DELETE FROM orders"
 Blocked by a guardrail:
-  - DELETE with no WHERE clause -- this touches every row in the table.
+  - DELETE with no WHERE clause on orders -- this touches every row in the table.
   Re-run with --force if you really mean it.
 
 $ ctrlz run "UPDATE orders SET total = 0 WHERE created_at < '2020-01-01'" --dry-run
@@ -99,15 +99,142 @@ the row count it reports is the number the database *actually touched* — not a
 estimate from a query plan. Above the `--confirm-over` threshold (default 100
 rows) you get asked before the commit lands.
 
-Note that these checks read the SQL text with regexes. That is fine, because
-**nothing about undo correctness depends on them** — a guardrail that misses
-something costs you a warning, not your data.
+### These checks parse SQL, they do not pattern-match it
+
+Consider:
+
+```sql
+DELETE FROM audit USING (SELECT id FROM staging WHERE ok) q;
+```
+
+This deletes **every row** of `audit`. The `WHERE` restricts the subquery, not
+the delete. A guardrail that greps for the word `WHERE` waves it through;
+`ctrlz` blocks it:
+
+```console
+$ ctrlz check "DELETE FROM audit USING (SELECT id FROM staging WHERE ok) q"
+DELETE  audit   read by sqlglot (confidence 0.90)
+
+  [block] unfiltered-write
+      DELETE with no WHERE clause on audit -- this touches every row in the table.
+
+BLOCKED  risk 90/70
+  decided by 'unfiltered-write'
+```
+
+Three backends sit behind one interface: `sqlglot` (pure Python, the default),
+`pglast` (PostgreSQL's own grammar, `pip install ctrlz-sql[pg-parser]`), and a
+regex fallback that is always available. Analysis never raises — a statement
+too malformed to parse degrades to the fallback with a lower confidence score
+and a note saying so.
+
+**None of it is load-bearing for undo.** A missed warning costs you a warning,
+not your data. A test walks the AST of every capture engine and fails the build
+if one ever imports the analysis or policy packages.
+
+`ctrlz check` exits `0` for allow, `1` for warn, `2` for block, so CI can act
+on a verdict without parsing prose.
+
+## The rulebook
+
+Rules live in `ctrlz.policy.yaml`, so changing what your team considers
+dangerous is a reviewable diff rather than a release:
+
+```yaml
+version: 1
+
+defaults:
+  risk_threshold: 70
+  block_on_risk: false      # a high score warns; it does not refuse
+
+rules:
+  - name: protect-ledger
+    when:
+      tables: [ledger, "billing.*"]
+      kind: [write]
+    action: block
+    risk: 99
+    message: "{tables} is append-only -- raise a ticket instead"
+
+  - name: prod-needs-a-filter
+    when: {unfiltered: true}
+    scope: {environments: [production]}
+    action: block
+    risk: 95
+    message: "{statement} with no WHERE clause on {tables}"
+```
+
+```console
+$ ctrlz policy show          # the rules actually in force, and where from
+$ ctrlz policy test "<sql>"  # what would happen to this statement
+$ ctrlz policy lint          # validate the file
+$ ctrlz policy path          # which file was loaded
+```
+
+Three deliberate choices:
+
+- **Risk aggregates with `max()`, not a sum.** A summed score cannot be
+  explained — "why is this 84?" has no answer — and an unexplainable number in
+  a safety tool gets ignored. With `max()` the score always points at one rule,
+  and `--explain` names it.
+- **A high score warns; it does not block** unless you set
+  `block_on_risk: true`. A fresh install that refuses legitimate bulk work on
+  day one gets uninstalled, and a tool nobody runs protects nobody. Rules
+  carrying `action: block` still block on their own merit.
+- **The loader is strict.** An unknown field, a duplicate rule name, or a
+  version mismatch is an error with a suggestion — never a warning. A typo in a
+  safety rule must not silently disable it.
+
+Conditions are flat named fields — `statement`, `kind`, `unfiltered`,
+`has_filter`, `filter_is_tautology`, `tables`, `writes_untracked`,
+`min_confidence`, `max_confidence` — deliberately not an expression language. A
+rulebook that needs its own parser cannot be read at a glance.
+
+## Attribution
+
+Every operation records who made it:
+
+```console
+$ export CTRLZ_ACTOR=praveen CTRLZ_TICKET=OPS-1234
+
+$ ctrlz log
+ID        WHEN    STATE     ROWS  RISK  ACTOR    TABLES           LABEL
+97e9ce62  2m ago  undoable  284   90!   praveen  public.customers deactivate
+4f10c8a1  1h ago  undoable  3     0     ada      public.orders    fix totals
+```
+
+The `!` marks a statement that ran despite a block, via `--force`. The history
+shows what happened, not what we would have preferred.
+
+Attribution is written into the database's own change log, so it survives
+`ctrlz` being bypassed — a change made directly in `psql` still carries the
+database role that made it. Where `ctrlz` genuinely does not know who acted the
+column is `NULL`; a guessed actor in an audit trail is worse than an absent
+one.
+
+Configure with `CTRLZ_ACTOR`, `CTRLZ_TICKET`, `CTRLZ_HOST`,
+`CTRLZ_APPLICATION`, `CTRLZ_ENVIRONMENT`. All optional — resolution falls back
+to the OS user and hostname, and never fails, even on a stripped container with
+neither.
 
 ## Install
 
 ```bash
 pip install -e ".[postgres]"     # or just: pip install -e .   for SQLite only
+pip install -e ".[pg-parser]"    # optional: PostgreSQL's own SQL grammar
 ```
+
+The only required dependencies are `sqlglot` and `PyYAML`, both pure Python.
+Nothing needs a compiler.
+
+### Upgrading from 0.1
+
+Run `ctrlz init` against an existing database. The migration is additive —
+nullable columns only, no rewrites, no backfill — so it is fast on a large
+history table and cannot lose anything. Operations captured before the upgrade
+stay undoable and show no actor, which is the honest answer. There is a test
+that builds a real v0.1 database, captures history through v0.1 triggers,
+upgrades it, and undoes a pre-upgrade change.
 
 ## Getting started
 
@@ -151,7 +278,7 @@ Known limits
 | `ctrlz preview [op]` | row-by-row diff of what an undo would do |
 | `ctrlz undo [op]` | reverse it, with conflict detection |
 | `ctrlz redo` | reverse the last undo |
-| `ctrlz check "<sql>"` | run the guardrails without executing |
+| `ctrlz check "<sql>"` | run the guardrails without executing (exit 0/1/2) |
 | `ctrlz purge --older-than 24h` | trim history |
 | `ctrlz doctor` | what is protected, what is not, and what cannot be promised |
 
@@ -215,6 +342,20 @@ covers the cases that make this hard rather than only the happy path: cascading
 deletes, concurrent modification, re-used primary keys, sequence resync after
 restore, foreign-key ordering, delete-then-reinsert over the same key,
 capture-limit refusal, and the race between assessment and apply.
+
+Beyond that:
+
+- a **differential corpus** of SQL statements every analysis backend must read
+  the same way, with each fallback limitation recorded and explained rather
+  than quietly tolerated;
+- a **fuzz corpus** asserting `analyze()` never raises, on empty strings,
+  unterminated literals, binary junk and 500 nested parentheses;
+- a **layering guard** that fails the build if a capture engine ever imports
+  the analysis or policy packages;
+- a **migration test** that upgrades a genuine v0.1 database and undoes history
+  captured before the upgrade;
+- **benchmarks** asserting the analysis budget (measured: 0.25 ms median,
+  0.46 ms p99 for parse plus policy evaluation).
 
 ## License
 
