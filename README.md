@@ -299,9 +299,28 @@ we failed to judge is still a statement we can undo. There is a fault-injection
 test that forces evaluation to raise on every statement and asserts the client
 still completes its work.
 
-Measured overhead per statement: **0.26 ms** first sight, **0.0015 ms** for a
-statement already seen (verdicts are memoised because analysis is pure), against
-a 1 ms budget.
+### What it costs you
+
+Published on every CI build, not estimated. Medians; see NFR-2 in
+[`spec/spec.md`](./spec/spec.md) for p99s and why a p99 from a shared runner is
+an upper bound on the machine rather than a property of the code.
+
+| the gateway sees | added per statement |
+|---|---|
+| a statement it has judged before | **0.001 ms** |
+| ordinary DML, first sight | **0.31 ms** |
+| a CTE or a large join, first sight | **0.83 ms** |
+
+Verdicts are memoised, because analysis is pure. The cache keys on exact
+statement text, so **which row you get depends on your driver**: parameterised
+clients (psycopg3, JDBC) send `WHERE id = $1` once and land in row one, while
+drivers that interpolate client-side — psycopg2 among them — send `WHERE id = 5`
+then `WHERE id = 6` and land in row two every time. Row two is the number to
+plan against if you are not sure, and it is still comfortably inside budget.
+
+Capture is separate and costs **1.2×–1.5× a plain write** on a tracked table.
+The ratio is worse on faster storage, because a trigger's cost is roughly fixed
+while the write beneath it gets cheaper — plan against 1.5×.
 
 ## For applications that cannot be re-pointed
 
@@ -581,8 +600,12 @@ Beyond that:
 - a **fault-injection test** proving the gateway fails open;
 - an **agreement test** asserting the gateway, the SDK and the CLI reach
   identical verdicts;
-- **benchmarks** asserting the analysis budget (measured: 0.25 ms median,
-  0.46 ms p99 for parse plus policy; 0.0015 ms for a repeated statement).
+- **benchmarks that publish their numbers** into the CI job summary rather than
+  asserting a budget and discarding the measurement — a budget that is only
+  asserted tells you nothing collapsed, not what the thing costs or which way it
+  has been moving. Both NFR-1 (capture overhead) and NFR-2 (gateway overhead)
+  are measured on every build, on two engines, and the figures in this README
+  come from them.
 
 ## License
 

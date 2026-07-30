@@ -1,6 +1,9 @@
 """Performance budgets, asserted rather than hoped for.
 
-NFR-2 gives the gateway a budget of under 1 ms p99 for analysing a statement.
+NFR-2 budgets what the gateway adds per statement: under 1 ms p99 whether or
+not it has seen the statement before, and under 2 ms on a first look at complex
+analytical SQL. It is stated as cases rather than one number because cache
+state moves the figure ~400x and parse difficulty moves it ~3x.
 Phase 2 cannot meet a budget that Phase 1 has already blown, and "it felt fast
 on my laptop" is not a measurement, so the budget is checked here while the
 analysis layer is still the only thing in the path.
@@ -21,8 +24,21 @@ import pytest
 from ctrlz.analysis import analyze
 from ctrlz.policy import PolicyEngine, load_defaults
 
-#: NFR-2. The gateway's whole budget, spent here on analysis alone.
+#: NFR-2, steady state: what the gateway adds to a statement it has judged
+#: before. This is the figure a parameterised client experiences on almost
+#: every statement.
 BUDGET_MS = 1.0
+
+#: NFR-2, first sight of complex analytical SQL -- a CTE, a many-table join.
+#: Stated separately because the original single budget averaged cases that
+#: differ by ~400x (cache state) and ~3x (parse difficulty), and an average of
+#: incomparable things is not a checkable requirement.
+#:
+#: These statements spend tens of milliseconds in the database, so the extra
+#: millisecond is not detectable; ordinary DML stays on the 1 ms budget above,
+#: including on first sight, which is what clients that inline their literals
+#: (psycopg2 among them) get on every statement.
+COMPLEX_COLD_BUDGET_MS = 2.0
 
 STATEMENTS = [
     "UPDATE users SET salary = 90000 WHERE id = 5",
@@ -57,14 +73,20 @@ def test_analysis_stays_within_the_gateway_budget(backend, benchmark):
     measure(lambda sql: analyze(sql, prefer=backend), iterations=20)  # warm up
     timings = measure(lambda sql: analyze(sql, prefer=backend))
 
+    # STATEMENTS is deliberately hard -- CTEs, a six-table join -- so this is
+    # NFR-2's first-sight-complex case, not its steady-state one.
+    budget = BUDGET_MS if backend == "regex" else COMPLEX_COLD_BUDGET_MS
     recorded = benchmark.record(
-        f"analysis ({backend})", "one statement, parsed and classified",
-        timings, budget_ms=BUDGET_MS,
+        f"analysis ({backend})", "first sight, complex SQL", timings,
+        budget_ms=budget,
     )
-    assert recorded.p99_ms < BUDGET_MS * 10, (
-        f"{backend}: p99 {recorded.p99_ms:.3f} ms, median "
-        f"{recorded.median_ms:.3f} ms -- an order of magnitude over the "
-        f"{BUDGET_MS} ms budget in NFR-2"
+    assert recorded.median_ms < budget, (
+        f"{backend}: median {recorded.median_ms:.3f} ms, over the {budget} ms "
+        f"NFR-2 allows for a first look at a statement this complex"
+    )
+    assert recorded.p99_ms < budget * 5, (
+        f"{backend}: p99 {recorded.p99_ms:.3f} ms -- far enough over {budget} ms "
+        f"to be a regression rather than a noisy machine"
     )
 
 
@@ -80,8 +102,8 @@ def test_policy_evaluation_adds_little_over_the_parse(benchmark):
     analysis_only = measure(lambda sql: analyze(sql))
     with_policy = measure(lambda sql: engine.evaluate_sql(sql))
     benchmark.record(
-        "analysis + policy", "one statement, analysed and judged", with_policy,
-        budget_ms=BUDGET_MS,
+        "analysis + policy", "first sight, complex SQL, judged", with_policy,
+        budget_ms=COMPLEX_COLD_BUDGET_MS,
     )
 
     overhead = statistics.median(with_policy) - statistics.median(analysis_only)
@@ -331,3 +353,60 @@ def test_capture_overhead_on_postgres(benchmark):
             cur.execute(f"DROP SCHEMA {schema} CASCADE")
             cur.execute("DROP SCHEMA IF EXISTS ctrlz CASCADE")
         admin.close()
+
+
+def test_the_cost_when_every_statement_is_new(benchmark):
+    """The workload the memoised number does not describe.
+
+    The cache is keyed on exact statement text. psycopg2 interpolates
+    parameters client-side, so `WHERE id = 5` and `WHERE id = 6` arrive as
+    different statements and never share an entry -- for those clients the cold
+    path *is* the hot path. That is not a hypothetical: psycopg2 is one of the
+    two clients this project's own gateway tests drive.
+
+    Restating NFR-2 around "real traffic repeats itself" without this number
+    would have been true of parameterised clients and quietly false of a very
+    large installed base.
+    """
+    from ctrlz.gateway import Interceptor, protocol
+
+    interceptor = Interceptor(tracked=("users", "orders"))
+    unique = [
+        protocol.Message(
+            protocol.QUERY,
+            f"UPDATE users SET salary = {n} WHERE id = {n}\x00".encode(),
+        )
+        for n in range(400)
+    ]
+    for message in unique[:20]:
+        interceptor.inspect(message)
+
+    timings: list[float] = []
+    for message in unique[20:]:
+        start = time.perf_counter()
+        interceptor.inspect(message)
+        timings.append((time.perf_counter() - start) * 1000)
+
+    recorded = benchmark.record(
+        "gateway interceptor (all new)",
+        "a client that inlines literals, e.g. psycopg2", timings,
+        budget_ms=BUDGET_MS,
+    )
+    # The 1 ms budget, not the complex-SQL one: inlined-literal traffic is
+    # ordinary DML, and NFR-2 holds the ordinary case to the original number
+    # rather than leaning on a cache these clients never hit.
+    #
+    # Asserted on the median, with p99 as a looser tripwire, because that is
+    # the methodology NFR-2 itself now states: runs of this suite on a busy
+    # container have produced p99s of 11 ms and 27 ms for code that measures
+    # 1.2 ms on a quiet one. Those are the scheduler. Writing a strict p99
+    # assertion here would have contradicted the note in the spec and flaked
+    # for the reason that note gives.
+    assert recorded.median_ms < BUDGET_MS, (
+        f"a cache-missing ordinary statement costs {recorded.median_ms:.3f} ms "
+        f"at the median, over the {BUDGET_MS} ms NFR-2 allows"
+    )
+    assert recorded.p99_ms < BUDGET_MS * 5, (
+        f"p99 {recorded.p99_ms:.3f} ms is far enough over the {BUDGET_MS} ms "
+        f"budget to be a regression rather than a noisy machine"
+    )
