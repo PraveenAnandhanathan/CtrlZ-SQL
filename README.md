@@ -307,16 +307,21 @@ an upper bound on the machine rather than a property of the code.
 
 | the gateway sees | added per statement |
 |---|---|
-| a statement it has judged before | **0.001 ms** |
-| ordinary DML, first sight | **0.31 ms** |
-| a CTE or a large join, first sight | **0.83 ms** |
+| a statement shape it has judged before | **0.008 ms** |
+| the same shape with different values | **0.008 ms** |
+| a shape it has never seen — ordinary DML | **0.36 ms** |
+| a shape it has never seen — CTE or large join | **0.83 ms** |
 
-Verdicts are memoised, because analysis is pure. The cache keys on exact
-statement text, so **which row you get depends on your driver**: parameterised
-clients (psycopg3, JDBC) send `WHERE id = $1` once and land in row one, while
-drivers that interpolate client-side — psycopg2 among them — send `WHERE id = 5`
-then `WHERE id = 6` and land in row two every time. Row two is the number to
-plan against if you are not sure, and it is still comfortably inside budget.
+Verdicts are memoised, because analysis is pure. The key is a **fingerprint with
+literal values removed**, so `WHERE id = 5` and `WHERE id = 6` share one entry —
+which matters because plenty of drivers (psycopg2 among them) interpolate
+parameters client-side and would otherwise never get a cache hit at all. It was
+0.32 ms per statement for those clients before the fingerprint existed.
+
+Removing literals is done carefully rather than blindly: `WHERE 1 = 1` is a
+tautology and `WHERE 1 = 2` is not, so a statement comparing one literal to
+another keeps its exact text as the key. Getting that wrong would let a
+statement touching every row inherit a verdict from one matching none.
 
 Capture is separate and costs **1.2×–1.5× a plain write** on a tracked table.
 The ratio is worse on faster storage, because a trigger's cost is roughly fixed
