@@ -129,6 +129,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-attribution", action="store_true",
         help="do not record the connecting user against changes",
     )
+    p.add_argument(
+        "--max-connections", type=int, default=100,
+        help="clients served at once (default 100). Each one holds a database "
+             "connection, so keep this below the database's own limit; 0 "
+             "disables the cap",
+    )
+    p.add_argument(
+        "--handshake-timeout", type=float, default=30.0,
+        help="seconds a client has to authenticate before being dropped "
+             "(default 30)",
+    )
     p.add_argument("--tls-cert", help="PEM certificate served to clients")
     p.add_argument("--tls-key", help="PEM private key for --tls-cert")
     p.add_argument(
@@ -716,6 +727,8 @@ def cmd_gateway(toolkit: Toolkit, args) -> int:
             tls=tls,
             require_tls=args.require_tls,
             strip_channel_binding=args.strip_channel_binding,
+            max_connections=args.max_connections,
+            handshake_timeout=args.handshake_timeout,
         )
     except TLSConfigError as exc:
         # Refused at configuration time on purpose: every one of these would
@@ -767,6 +780,10 @@ def cmd_gateway(toolkit: Toolkit, args) -> int:
             f"\nStopped. {gateway.stats.connections} connection(s), "
             f"{gateway.stats.statements} statement(s) checked, "
             f"{gateway.stats.refused} refused."
+            + (f" {gateway.stats.turned_away} turned away at the connection "
+               f"limit." if gateway.stats.turned_away else "")
+            + (f" {gateway.stats.timed_out} timed out authenticating."
+               if gateway.stats.timed_out else "")
         )
     return 0
 

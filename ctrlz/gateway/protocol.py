@@ -45,6 +45,11 @@ SSL_ACCEPTED = b"S"
 #: is what a refusal by policy actually is, and clients already understand it.
 SQLSTATE_BLOCKED = "42501"
 
+#: SQLSTATE for a connection refused because the gateway is at its limit.
+#: PostgreSQL's own code for the same condition, so clients and pools already
+#: know to back off and retry rather than treat it as fatal.
+SQLSTATE_TOO_MANY = "53300"
+
 MAX_MESSAGE_BYTES = 1 << 30  # 1 GiB; beyond this the stream is not a session
 
 

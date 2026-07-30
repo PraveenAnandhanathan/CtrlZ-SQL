@@ -57,6 +57,29 @@ log = logging.getLogger("ctrlz.gateway")
 STARTUP_HEADER = 8
 MAX_STARTUP_BYTES = 1 << 20
 
+#: How many client connections to serve at once.
+#:
+#: This is not about the gateway's own memory. The gateway opens **one upstream
+#: database connection per client**, so without a cap it turns an unbounded
+#: number of clients into an unbounded number of database connections and
+#: exhausts the server's `max_connections` -- locking out everybody, including
+#: clients that never went near the gateway.
+#:
+#: That is the one failure mode the whole design is supposed to make
+#: impossible. Failing open covers a bug in the checkpoint; it does not cover
+#: the checkpoint using up the resource it sits in front of. Set this below the
+#: database's own limit, leaving room for direct connections and for whatever
+#: else connects.
+DEFAULT_MAX_CONNECTIONS = 100
+
+#: Seconds a client has to get from "connected" to "authenticated".
+#:
+#: Without it, a connection that opens and then says nothing holds a task, a
+#: socket and (once past the startup packet) a database connection for as long
+#: as it likes. Ten of those are a nuisance; the cap above makes a hundred of
+#: them an outage. Generous enough for a slow network and a SCRAM round trip.
+DEFAULT_HANDSHAKE_TIMEOUT = 30.0
+
 
 @dataclass
 class Upstream:
@@ -132,6 +155,10 @@ class Stats:
     statements: int = 0
     refused: int = 0
     failed_open: int = 0
+    #: Refused because the gateway was already at max_connections.
+    turned_away: int = 0
+    #: Dropped for not completing the handshake in time.
+    timed_out: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -148,6 +175,8 @@ class Gateway:
         tls: Optional[ServerTLS] = None,
         require_tls: bool = False,
         strip_channel_binding: bool = False,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
     ):
         self.upstream = upstream
         self.interceptor = Interceptor(
@@ -157,6 +186,8 @@ class Gateway:
         self.tls = tls
         self.require_tls = require_tls
         self.strip_channel_binding = strip_channel_binding
+        self.max_connections = max_connections
+        self.handshake_timeout = handshake_timeout
         self.stats = Stats()
         self._tls_context: Optional[ssl.SSLContext] = None
         self._server: Optional[asyncio.AbstractServer] = None
@@ -295,7 +326,19 @@ class Gateway:
         self.stats.connections += 1
         server_writer: Optional[asyncio.StreamWriter] = None
         try:
-            negotiated = await self._negotiate(client_reader, client_writer)
+            # Checked before anything upstream is opened. Refusing a client is
+            # a nuisance; opening the connection first and refusing afterwards
+            # would spend the database resource we are trying to protect.
+            if not self._admit(client_writer):
+                return
+
+            # The handshake is bounded because a client that connects and then
+            # says nothing would otherwise hold a slot indefinitely, and a held
+            # slot is one the cap above has already counted.
+            negotiated = await asyncio.wait_for(
+                self._negotiate(client_reader, client_writer),
+                timeout=self.handshake_timeout,
+            )
             if negotiated is None:
                 return
             # A TLS upgrade replaces the stream pair, so rebind rather than
@@ -319,8 +362,11 @@ class Gateway:
                 application=startup.application or None,
             )
 
-            ready = await self._relay_authentication(
-                client_reader, server_reader, client_writer, server_writer, actor
+            ready = await asyncio.wait_for(
+                self._relay_authentication(
+                    client_reader, server_reader, client_writer, server_writer, actor
+                ),
+                timeout=self.handshake_timeout,
             )
             if not ready:
                 return
@@ -332,6 +378,9 @@ class Gateway:
                 self._pump_server_to_client(server_reader, client_writer),
                 return_exceptions=True,
             )
+        except asyncio.TimeoutError:
+            self.stats.timed_out += 1
+            log.info("dropped a connection that did not finish authenticating")
         except (
             ConnectionResetError,
             BrokenPipeError,
@@ -345,6 +394,39 @@ class Gateway:
         finally:
             _close(client_writer)
             _close(server_writer)
+
+    def _admit(self, client_writer: asyncio.StreamWriter) -> bool:
+        """Whether there is room for this client.
+
+        `_sessions` already contains the task handling this connection, so the
+        comparison is against the limit itself rather than one below it.
+
+        A refusal is a protocol-native error carrying PostgreSQL's own
+        `53300`, which connection pools and clients already understand as
+        "retry later" rather than as a fatal condition.
+        """
+        if self.max_connections <= 0 or len(self._sessions) <= self.max_connections:
+            return True
+
+        self.stats.turned_away += 1
+        log.warning(
+            "refused a connection: already serving %s, the limit is %s",
+            len(self._sessions) - 1, self.max_connections,
+        )
+        try:
+            client_writer.write(
+                protocol.error_response(
+                    "too many connections for this ctrlz gateway",
+                    sqlstate=protocol.SQLSTATE_TOO_MANY,
+                    detail=f"the gateway is serving its limit of "
+                           f"{self.max_connections} connections",
+                    hint="retry shortly, or raise --max-connections (keeping it "
+                         "below the database's own limit)",
+                )
+            )
+        except Exception:  # noqa: BLE001 - the client may already be gone
+            pass
+        return False
 
     async def _connect_upstream(self):
         """Open the upstream connection, negotiating TLS if asked for.
