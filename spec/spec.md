@@ -291,7 +291,7 @@ Replace regex pre-flight with a real parser behind a stable interface.
 | NFR-2 | Gateway adds < 1 ms p99 per statement, whether or not it has seen it before; < 2 ms on first sight of complex analytical SQL | benchmark in CI — **met**, restated after measurement (see below) |
 | NFR-3 | Gateway failure never blocks database access | fault-injection test |
 | NFR-4 | Zero client-side changes required to use the gateway | integration test with real `psql` |
-| NFR-5 | No credentials, row values, or connection strings in logs | test asserts redaction |
+| NFR-5 | No credentials, row values, or connection strings in logs | test asserts redaction — **now actually written; it found a leak, §11** |
 | NFR-6 | Undo is idempotent — undoing twice is refused, not applied twice | existing test |
 | NFR-7 | Every engine passes the identical behavioural suite | CI matrix |
 | NFR-8 | Python 3.10+; no mandatory C-extension dependency | `pip install ctrlz-sql` on clean env |
@@ -481,6 +481,43 @@ The specification is satisfied when all of the following hold:
 | MySQL trigger limitations (no `AFTER` on some engines, no DDL triggers) | FR-5 partially unmet | treat as a finding; document rather than paper over |
 | Central store becomes a perceived source of truth | undo run against stale data | undo only ever executes against the source DB (FR-6.4) |
 | Generated trigger SQL is an injection surface | attacker-chosen text in a trigger a privileged user creates | identifiers *and* literals escaped per engine; hostile-name suite on all three (found in a pre-release audit, §11) |
+
+### Closed: a parser's error message carried the statement into the logs
+
+NFR-5 said "no credentials, row values, or connection strings in logs" and gave
+"test asserts redaction" as how that was measured. **There was no such test.**
+Writing it found a leak in under a minute:
+
+```
+ctrlz.analysis DEBUG analysis backend sqlglot failed: Invalid expression …
+  INSERT INTO patients (ssn) VALUES ('123-45-6789')
+                                     ^
+```
+
+`sqlglot`'s `ParseError` renders the offending statement with a caret under the
+token. The log line said `%s` of the exception and never mentioned SQL, so
+reading the code would not have shown it — which is why the test runs the real
+paths with marked secrets and greps the output instead of reasoning about it.
+
+**A statement is not metadata.** `INSERT INTO patients (ssn) VALUES ('…')` *is*
+the row value, and it was going into a file with different permissions, a
+different retention policy and quite possibly a different jurisdiction. The
+whole point of NFR-5 is that turning on debug logging must be safe.
+
+Fixed by logging exception *types* and never their messages on any path that
+handles a statement — the analysis fallback and both of the interceptor's
+fail-open branches, which used `log.exception` and so rendered the message
+inside a traceback. Paths that never see SQL (TLS, connection setup) still log
+the message, because there the detail is worth having.
+
+It costs a little diagnostic detail: the parser's own words, and the line and
+column. That is the better trade for a tool in this position, and the statement
+is in the hands of whoever ran it anyway — the log does not need to repeat it.
+
+The first version of the interceptor test raised an exception whose message did
+*not* contain the statement, so it passed against the leaking code. It now
+raises one that quotes the SQL, the way a real parser error does, and all four
+of these tests are checked to fail against the unfixed code.
 
 ### Closed: generated SQL escaped identifiers but not literals
 
