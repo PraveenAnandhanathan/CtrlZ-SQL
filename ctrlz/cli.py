@@ -289,7 +289,30 @@ def cmd_tracked(toolkit: Toolkit, args) -> int:
     return 0
 
 
+def _announce_policy(toolkit: Toolkit) -> None:
+    """Name the rulebook in force, when it is not the built-in one.
+
+    Guardrails are the headline protection, and a policy file can switch them
+    off. Before this, an ordinary `run` gave no sign a policy file existed --
+    so a rulebook inherited from a parent directory, or committed to a repo by
+    somebody else, changed what ctrlz refused without ever saying so. Ownership
+    is now checked as well, but a check can only cover the hostile case; this
+    covers the far commoner one where nobody meant any harm.
+    """
+    source = toolkit.policy.source
+    if not source or source.startswith("<"):
+        return          # the shipped defaults: nothing surprising to report
+    print(
+        render.c(
+            f"policy: {source} ({len(toolkit.policy.rules)} rule(s))", "dim"
+        ),
+        file=sys.stderr,
+    )
+
+
 def cmd_run(toolkit: Toolkit, args) -> int:
+    _announce_policy(toolkit)
+
     def confirm(rowcount: int, sql: str) -> bool:
         if args.yes:
             return True

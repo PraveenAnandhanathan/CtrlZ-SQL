@@ -482,6 +482,34 @@ The specification is satisfied when all of the following hold:
 | Central store becomes a perceived source of truth | undo run against stale data | undo only ever executes against the source DB (FR-6.4) |
 | Generated trigger SQL is an injection surface | attacker-chosen text in a trigger a privileged user creates | identifiers *and* literals escaped per engine; hostile-name suite on all three (found in a pre-release audit, §11) |
 
+### Closed: a rulebook from a parent directory silently disabled the guardrails
+
+`find_policy_file` walks up the directory tree, which is convenient and is also
+how a rulebook nobody chose ends up governing a session. A policy can *weaken*
+protection — an empty `rules:` list removes every guardrail — so this is not a
+configuration nicety. Measured:
+
+```
+$ cd /shared/someones/work          # /shared/ctrlz.policy.yaml has rules: []
+$ ctrlz run "DELETE FROM t"
+Committed. 2 row(s) affected.       # the flagship refusal, gone
+```
+
+Nothing in that output says a policy file was read, or from where.
+
+Same shape as git's CVE-2022-24765, and the same answer: **a configuration file
+found by searching upwards is trusted only if it belongs to you.** Files owned
+by another user are refused by name, with `$CTRLZ_POLICY` given as the way to
+consent — asking for a file explicitly is a decision rather than an accident.
+Root-owned files pass, because an administrator placing a site-wide policy is
+doing so deliberately and can do anything else on the machine regardless.
+
+Ownership checking cannot cover the commoner, non-malicious case: a repository
+policy that is legitimately yours and that you have never read. So `ctrlz run`
+now names the rulebook in force whenever it is not the built-in default, and
+stays quiet when it is — announcing the default on every run would be the kind
+of noise that stops people reading the line that matters.
+
 ### Closed: a parser's error message carried the statement into the logs
 
 NFR-5 said "no credentials, row values, or connection strings in logs" and gave

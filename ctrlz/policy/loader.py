@@ -54,8 +54,59 @@ def find_policy_file(start: Optional[str] = None) -> Optional[pathlib.Path]:
         for name in POLICY_FILENAMES:
             candidate = directory / name
             if candidate.is_file():
+                _check_ownership(candidate)
                 return candidate
     return None
+
+
+def _check_ownership(path: pathlib.Path) -> None:
+    """Refuse a discovered policy file that somebody else owns.
+
+    Walking up the tree to find a rulebook is convenient and is also how a
+    rulebook you never chose ends up governing your session. A policy can
+    *weaken* protection -- an empty ``rules:`` list disables every guardrail --
+    so a file dropped in a shared parent directory silently turns the safety
+    net off, and nothing in the output of an ordinary ``ctrlz run`` says a
+    policy file was involved at all.
+
+    Measured before this check existed: a ``ctrlz.policy.yaml`` two directories
+    up took ``DELETE FROM t`` with no WHERE from blocked to committed.
+
+    This is the same shape as git's CVE-2022-24765, and the answer is the same
+    one git settled on: a configuration file discovered by searching upwards is
+    only trusted if it belongs to you. Root-owned files pass, because a system
+    administrator placing a site-wide policy is doing so deliberately and can
+    do anything else anyway.
+
+    Naming a file explicitly through ``$CTRLZ_POLICY`` bypasses this: asking
+    for a specific file by name is consent, and that path never reaches here.
+    """
+    if os.name != "posix":
+        return
+    try:
+        owner = path.stat().st_uid          # follows symlinks: the real target
+    except OSError:
+        return                              # unreadable: load_file will say so
+    if owner in (os.getuid(), 0):
+        return
+
+    import pwd
+
+    def named(uid: int) -> str:
+        try:
+            return f"{pwd.getpwuid(uid).pw_name} ({uid})"
+        except KeyError:
+            return f"uid {uid}"
+
+    raise ConfigError(
+        f"refusing to use the policy at {path}: it is owned by "
+        f"{named(owner)}, and you are {named(os.getuid())}.\n"
+        f"  ctrlz found it by searching upwards from the current directory. A "
+        f"policy file can switch guardrails off, so one you did not put there "
+        f"is not trusted by default.\n"
+        f"  If you meant to use it:  CTRLZ_POLICY={path} ctrlz ...\n"
+        f"  If you did not:  it is somebody else's file in a shared directory."
+    )
 
 
 def load_policy(path: Optional[str | pathlib.Path] = None) -> Policy:
