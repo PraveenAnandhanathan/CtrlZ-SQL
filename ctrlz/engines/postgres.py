@@ -228,6 +228,21 @@ class PostgresEngine(Engine):
     def _regclass(self, schema: str, table: str) -> sql.Composed:
         return sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table))
 
+    def _bindable(self, composable) -> sql.SQL:
+        """Render an identifier for a statement that also carries parameters.
+
+        psycopg2 applies %-interpolation to the rendered statement, so a `%`
+        that came from an identifier is read as the start of a placeholder.
+        `sql.Identifier` protects against injection; it does not protect
+        against this. A column legitimately named ``per%cent`` produced
+        "dict is not a sequence" from deep inside the driver.
+
+        Rendered through psycopg2's own machinery first, so there is still only
+        one implementation of identifier quoting -- only the doubling is ours.
+        Use this wherever an identifier and a bound parameter share a statement.
+        """
+        return sql.SQL(composable.as_string(self.conn).replace("%", "%%"))
+
     def _require_init(self) -> None:
         if not self.is_initialized():
             raise NotInitialized("ctrlz is not installed in this database; run: ctrlz init")
@@ -847,14 +862,14 @@ class PostgresEngine(Engine):
         return applied, [], touched, reinserted
 
     def _apply_inverse(self, cur, change: Change, force: bool) -> int:
-        target = self._regclass(change.table_schema, change.table_name)
+        target = self._bindable(self._regclass(change.table_schema, change.table_name))
         identity_cols = list(change.identity.keys())
 
         if change.action == INSERT:
             # Undo an INSERT by deleting the row, but only if it still looks
             # exactly like the row we inserted.
             match = sql.SQL(" AND ").join(
-                sql.SQL("t.{col} IS NOT DISTINCT FROM j.{col}").format(col=sql.Identifier(c))
+                sql.SQL("t.{col} IS NOT DISTINCT FROM j.{col}").format(col=self._bindable(sql.Identifier(c)))
                 for c in identity_cols
             )
             query = sql.SQL(
@@ -870,7 +885,7 @@ class PostgresEngine(Engine):
 
         if change.action == DELETE:
             cols = self._writable_columns(change.table_schema, change.table_name)
-            col_list = sql.SQL(", ").join(sql.Identifier(c) for c in cols)
+            col_list = sql.SQL(", ").join(self._bindable(sql.Identifier(c)) for c in cols)
             overriding = (
                 sql.SQL("OVERRIDING SYSTEM VALUE")
                 if self._has_always_identity(change.table_schema, change.table_name)
@@ -888,16 +903,16 @@ class PostgresEngine(Engine):
         cols = self._updatable_columns(change.table_schema, change.table_name)
         if not cols:
             return 0
-        col_list = sql.SQL(", ").join(sql.Identifier(c) for c in cols)
+        col_list = sql.SQL(", ").join(self._bindable(sql.Identifier(c)) for c in cols)
         match = sql.SQL(" AND ").join(
-            sql.SQL("t.{col} IS NOT DISTINCT FROM j.{col}").format(col=sql.Identifier(c))
+            sql.SQL("t.{col} IS NOT DISTINCT FROM j.{col}").format(col=self._bindable(sql.Identifier(c)))
             for c in identity_cols
         )
         source = sql.SQL(
             "(SELECT {cols} FROM jsonb_populate_record(NULL::{target}, %(before)s::jsonb))"
         ).format(cols=col_list, target=target)
         assignment = (
-            sql.SQL("{col} = {source}").format(col=sql.Identifier(cols[0]), source=source)
+            sql.SQL("{col} = {source}").format(col=self._bindable(sql.Identifier(cols[0])), source=source)
             if len(cols) == 1
             else sql.SQL("({cols}) = {source}").format(cols=col_list, source=source)
         )

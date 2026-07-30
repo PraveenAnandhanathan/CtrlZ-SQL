@@ -185,11 +185,21 @@ class MySQLEngine(Engine):
         except Exception:
             pass
 
+    #: Passed to the driver when there is nothing to bind.
+    #:
+    #: It has to be None rather than (). pymysql applies `query % args`
+    #: whenever args is not None, and an empty tuple is not None -- so every
+    #: parameterless statement was being run through %-formatting. Generated
+    #: SQL that contained a literal `%` (a column named `per%cent` is legal,
+    #: and so is a table) then died with "not enough arguments for format
+    #: string" before it reached the server.
+    NO_PARAMS = None
+
     def _all(self, query: str, params: tuple = ()) -> list[dict]:
         import pymysql.cursors
 
         with self.conn.cursor(pymysql.cursors.DictCursor) as cur:
-            cur.execute(query, params)
+            cur.execute(query, params or self.NO_PARAMS)
             return list(cur.fetchall())
 
     def _one(self, query: str, params: tuple = ()) -> Optional[dict]:
@@ -198,7 +208,7 @@ class MySQLEngine(Engine):
 
     def _exec(self, query: str, params: tuple = ()) -> int:
         with self.conn.cursor() as cur:
-            cur.execute(query, params)
+            cur.execute(query, params or self.NO_PARAMS)
             return cur.rowcount
 
     def _require_init(self) -> None:
@@ -208,6 +218,36 @@ class MySQLEngine(Engine):
     @staticmethod
     def _quote(name: str) -> str:
         return "`" + str(name).replace("`", "``") + "`"
+
+    @staticmethod
+    def _for_binding(fragment: str) -> str:
+        """Make a SQL fragment safe to sit alongside bound parameters.
+
+        pymysql applies `query % args` when args are supplied, so a `%` that
+        came from an identifier is read as a placeholder and the statement dies
+        with "not enough arguments for format string". `per%cent` is a legal
+        column name. Applied to name-derived fragments only -- never to the
+        `%s` placeholders the code adds itself, which must survive.
+        """
+        return fragment.replace("%", "%%")
+
+    @staticmethod
+    def _literal(value: str) -> str:
+        """A SQL string literal, for names that end up *inside* quotes.
+
+        Column and table names reach the trigger body twice: as identifiers,
+        which `_quote` handles, and as JSON keys and log values, which are
+        string literals. The second path was interpolating the raw name.
+
+        **Doubling the quote is not sufficient here.** Unlike SQLite and
+        PostgreSQL-with-standard_conforming_strings, MySQL treats backslash as
+        an escape character inside string literals unless NO_BACKSLASH_ESCAPES
+        is set, which it is not by default. A name ending in a backslash would
+        escape the closing quote and swallow whatever followed, so backslashes
+        are doubled too. A fix that handled only the quote would have looked
+        complete and left the hole open on this engine alone.
+        """
+        return "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -388,7 +428,7 @@ class MySQLEngine(Engine):
                 )
             else:
                 value = reference
-            parts.append(f"'{name}', {value}")
+            parts.append(f"{self._literal(name)}, {value}")
         return "JSON_OBJECT(" + ", ".join(parts) + ")"
 
     # -- tracking ----------------------------------------------------------
@@ -466,7 +506,7 @@ class MySQLEngine(Engine):
 
             INSERT INTO ctrlz_change_log
                 (op_id, table_name, action, identity, `before`, `after`)
-            SELECT @ctrlz_op_id, '{table}', '{action[0]}',
+            SELECT @ctrlz_op_id, {self._literal(table)}, '{action[0]}',
                    {ident_expr}, {before}, {after}
               FROM DUAL
              WHERE (SELECT capped FROM ctrlz_operations WHERE op_id = @ctrlz_op_id) = 0;
@@ -702,10 +742,13 @@ class MySQLEngine(Engine):
         convert differently. One path, one answer.
         """
         table = change.table_name
-        image = self._image_expression(table, "")
-        where = " AND ".join(f"{self._quote(k)} <=> %s" for k in change.identity)
+        image = self._for_binding(self._image_expression(table, ""))
+        where = " AND ".join(
+            f"{self._for_binding(self._quote(k))} <=> %s" for k in change.identity
+        )
         rows = self._all(
-            f"SELECT {image} AS image FROM {self._quote(table)} WHERE {where}",
+            f"SELECT {image} AS image FROM {self._for_binding(self._quote(table))} "
+            f"WHERE {where}",
             tuple(_bind(v) for v in change.identity.values()),
         )
         return _decode(rows[0]["image"]) if rows else None
@@ -927,9 +970,14 @@ class MySQLEngine(Engine):
         return applied, [], touched
 
     def _apply_inverse(self, change: Change, force: bool) -> int:
-        table = self._quote(change.table_name)
+        table = self._for_binding(self._quote(change.table_name))
         columns = self._column_names(change.table_name)
-        ident_sql = " AND ".join(f"{self._quote(k)} <=> %s" for k in change.identity)
+        # Every fragment here shares a statement with bound parameters, so any
+        # `%` in a column or table name has to be doubled or pymysql reads it
+        # as a placeholder.
+        ident_sql = " AND ".join(
+            f"{self._for_binding(self._quote(k))} <=> %s" for k in change.identity
+        )
         ident_values = [_bind(v) for v in change.identity.values()]
 
         if change.action == INSERT:
@@ -942,7 +990,7 @@ class MySQLEngine(Engine):
         if change.action == DELETE:
             image = change.before or {}
             writable = [c for c in self._writable_columns(change.table_name) if c in image]
-            names = ", ".join(self._quote(c) for c in writable)
+            names = ", ".join(self._for_binding(self._quote(c)) for c in writable)
             placeholders = ", ".join("%s" for _ in writable)
             values = [_bind(image.get(c)) for c in writable]
             return self._exec(
@@ -953,7 +1001,9 @@ class MySQLEngine(Engine):
         writable = [c for c in self._writable_columns(change.table_name) if c in image]
         if not writable:
             return 0
-        assignments = ", ".join(f"{self._quote(c)} = %s" for c in writable)
+        assignments = ", ".join(
+            f"{self._for_binding(self._quote(c))} = %s" for c in writable
+        )
         set_values = [_bind(image.get(c)) for c in writable]
         guard, guard_values = self._guard(change, force)
         return self._exec(
@@ -996,7 +1046,10 @@ class MySQLEngine(Engine):
         stored = self._stored_image(change.seq, "after")
         if stored is None:
             return "", []
-        image = self._image_expression(change.table_name, "")
+        # The image names every column, and this fragment is spliced into a
+        # statement that binds the stored image -- so it needs the same
+        # percent-doubling as the rest of the inverse path.
+        image = self._for_binding(self._image_expression(change.table_name, ""))
         return f" AND {image} = CAST(%s AS JSON)", [stored]
 
     # -- settings ----------------------------------------------------------
