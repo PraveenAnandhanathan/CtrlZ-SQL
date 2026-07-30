@@ -534,6 +534,41 @@ with ctrlz.connect("postgresql://localhost/app") as cz:
     cz.undo("last")
 ```
 
+## What it keeps, and where
+
+Undo works by keeping copies of your rows, so it is worth being explicit about
+what that means before you switch it on.
+
+**Inside your database.** `ctrlz_change_log` holds a before-and-after JSON image
+of every row changed on a tracked table. It lives in the same database, under
+the same permissions and the same backups as the data it copies — it is not
+shipped anywhere unless you run `ctrlz ship`. Anyone who can read a tracked
+table can generally read its change log too, so **tracking a table containing
+secrets puts a second copy of those secrets in the same database.**
+
+**It grows without limit until you trim it.** There is no automatic retention.
+
+```bash
+ctrlz purge --older-than 30d        # drop operations older than 30 days
+ctrlz purge --yes                   # drop the whole history
+```
+
+`purge` deletes the rows. It does not scrub the pages — as with any `DELETE`,
+the bytes survive on disk until the database reuses or vacuums the space, so
+treat it as "no longer queryable", not as secure erasure.
+
+**Nothing reaches the logs.** No row value, credential or connection string is
+written to a log at any level, including debug — exception *types* are logged
+rather than their messages on every path that handles a statement, because a
+parser error quotes the statement it failed on, and a statement is a row value.
+There is a test that plants marked secrets in the real paths and greps
+everything the logger emits.
+
+**The shared hub ships metadata only.** `ctrlz ship` sends who, what, when and
+how many — never row values — unless you pass `--include-values`, which is a
+data-governance decision and is therefore off by default rather than something
+to discover later.
+
 ## What this does not do
 
 Stated plainly, because a safety tool that overstates its coverage is worse
