@@ -78,8 +78,15 @@ class Interceptor:
         """Judge one message. Never raises."""
         try:
             sql = protocol.statement_of(message)
-        except Exception:  # noqa: BLE001 - fail open (D2.2)
-            log.exception("could not read a statement out of a %r message", message.tag)
+        except Exception as exc:  # noqa: BLE001 - fail open (D2.2)
+            # Type, not traceback. A traceback renders the exception's message,
+            # and the exceptions raised here are decoding errors that quote the
+            # bytes they failed on -- which are the statement, and therefore the
+            # row values (NFR-5).
+            log.error(
+                "could not read a statement out of a %r message (%s); forwarding",
+                message.tag, type(exc).__name__,
+            )
             self.failed_open += 1
             return Verdict(FORWARD)
 
@@ -88,8 +95,13 @@ class Interceptor:
 
         try:
             decision = self._evaluate(sql, actor)
-        except Exception:  # noqa: BLE001 - fail open (D2.2)
-            log.exception("policy evaluation failed; forwarding the statement")
+        except Exception as exc:  # noqa: BLE001 - fail open (D2.2)
+            # As above: no traceback, because anything raised while judging a
+            # statement is liable to quote it.
+            log.error(
+                "policy evaluation failed (%s); forwarding the statement",
+                type(exc).__name__,
+            )
             self.failed_open += 1
             return Verdict(FORWARD)
 

@@ -94,7 +94,16 @@ def analyze_script(
         try:
             results = backend_type().analyze_script(sql, dialect)
         except Exception as exc:  # noqa: BLE001 - deliberate: see module docstring
-            log.debug("analysis backend %s failed: %s", backend_type.name, exc)
+            # The exception *type*, never its message. A parser's error text
+            # quotes the statement it choked on -- sqlglot renders the whole
+            # line with a caret under the offending token -- and a statement is
+            # not metadata: `INSERT INTO patients (ssn) VALUES ('...')` is the
+            # row. NFR-5 says row values never reach logs, and a debug line
+            # that never mentions SQL is exactly how one would.
+            log.debug(
+                "analysis backend %s failed (%s)",
+                backend_type.name, type(exc).__name__,
+            )
             failures.append(f"{backend_type.name} could not parse this ({type(exc).__name__})")
             continue
         if not results:
