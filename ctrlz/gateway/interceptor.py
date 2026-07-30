@@ -20,6 +20,7 @@ from typing import Optional
 
 from ..policy import BLOCK, Context, Decision, PolicyEngine, Policy
 from . import protocol
+from .fingerprint import fingerprint
 
 log = logging.getLogger("ctrlz.gateway")
 
@@ -100,7 +101,12 @@ class Interceptor:
         return Verdict(REFUSE, decision=decision, reply=self._refusal(decision))
 
     def _evaluate(self, sql: str, actor: str) -> Decision:
-        key = (sql, actor)
+        # Keyed on a fingerprint rather than the statement, so that a client
+        # which interpolates its parameters -- psycopg2 does -- gets cache hits
+        # instead of paying a first look on every statement. The fingerprint
+        # declines to normalise anything whose literals could change the
+        # verdict; see gateway/fingerprint.py for why that is not optional.
+        key = (fingerprint(sql), actor)
         cached = self._cache.get(key)
         if cached is not None:
             return cached

@@ -359,29 +359,28 @@ whether the statement has been seen before, and how hard it is to parse:
 
 | case | median | p99 | budget | verdict |
 |---|---:|---:|---:|---|
-| statement seen before (any complexity) | 0.001 ms | 0.002 ms | 1 ms | ~500× inside |
-| first sight, ordinary DML | 0.31 ms | 0.55 ms | 1 ms | inside |
-| first sight, CTE + subquery | 0.78 ms | 1.25 ms | 2 ms | inside |
-| first sight, many-table JOIN | 0.83 ms | 1.26 ms | 2 ms | inside |
-| first sight, `regex` backend | 0.03 ms | 0.09 ms | 1 ms | 11× inside |
+| a statement shape seen before | 0.008 ms | 0.03 ms | 1 ms | ~125× inside |
+| same shape, different values | 0.008 ms | 0.03 ms | 1 ms | ~125× inside |
+| a shape never seen, ordinary DML | 0.36 ms | 0.66 ms | 1 ms | inside |
+| a shape never seen, CTE + subquery | 0.78 ms | 1.25 ms | 2 ms | inside |
+| a shape never seen, many-table JOIN | 0.83 ms | 1.26 ms | 2 ms | inside |
+| `regex` backend, never seen | 0.03 ms | 0.09 ms | 1 ms | 11× inside |
 
-**Why "seen before" is not the same as "amortised".** The interceptor memoises
-on exact statement text, so which column a client lands in depends on the
-client, not on luck:
+**"Seen before" means the shape, not the text.** That distinction is the whole
+reason the first two rows are the same number. The memo keys on a fingerprint
+with literal values removed, so a client that interpolates its parameters gets
+cache hits like any other — see §11, which also records why removing literals
+blindly would be a correctness bug rather than an optimisation.
 
-- **Parameterised clients** (psycopg3, JDBC, any driver using the extended
-  protocol) send `WHERE id = $1` once and reuse it. Row one, essentially free.
-- **Clients that inline literals** — psycopg2 among them, and it is very widely
-  deployed — send `WHERE id = 5` and then `WHERE id = 6`, which never share a
-  cache entry. **For those clients every statement is a first sight.**
+Before that fingerprint existed, clients inlining literals paid 0.32 ms on
+*every* statement, because `WHERE id = 5` and `WHERE id = 6` never shared an
+entry. That is why the restatement still holds ordinary DML to 1 ms cold rather
+than leaning on the cache: the budget should hold even for a workload whose
+every statement is genuinely new, and it does.
 
-That second case is why the restatement holds 1 ms for first-sight DML rather
-than leaning on the cache. Inlined-literal traffic is overwhelmingly ordinary
-DML, and ordinary DML measures 0.55 ms p99 cold — inside the original budget
-with room to spare. The cases that need 2 ms are CTEs and large joins, which
-are mostly `SELECT`s the gateway forwards untouched, and which spend tens of
-milliseconds in the database. 1.25 ms of analysis is not detectable against
-that.
+The cases needing 2 ms are CTEs and large joins on first sight — mostly
+`SELECT`s the gateway forwards untouched, which spend tens of milliseconds in
+the database. A millisecond of analysis is not detectable against that.
 
 **A note on p99 on shared hardware.** Runs of the suite on a busy container
 have produced p99s of 11 ms and 27 ms for the same code that measures 1.2 ms
@@ -482,19 +481,52 @@ The specification is satisfied when all of the following hold:
 | MySQL trigger limitations (no `AFTER` on some engines, no DDL triggers) | FR-5 partially unmet | treat as a finding; document rather than paper over |
 | Central store becomes a perceived source of truth | undo run against stale data | undo only ever executes against the source DB (FR-6.4) |
 
-### Open: the analysis cache misses for clients that inline literals
+### Closed: the analysis cache missed for clients that inline literals
 
-The interceptor memoises on exact statement text, so a driver that interpolates
-parameters client-side — psycopg2, and it is widely deployed — never gets a
-cache hit. Measured consequence: those clients pay the first-sight cost on every
-statement, 0.55 ms p99 for ordinary DML instead of 0.002 ms (NFR-2).
+The interceptor memoised on exact statement text, so a driver interpolating
+parameters client-side — psycopg2, widely deployed — never got a cache hit and
+paid a full parse on every statement.
 
-That is inside budget today, which is why it is an open question rather than a
-defect. Normalising literals out of the cache key would close it, and the reason
-it has not been done casually is that the rules read literals: a tautology check
-has to keep telling `WHERE 1 = 1` apart from `WHERE id = 5`. Any normalisation
-must preserve everything the analysis looks at, and would need the differential
-corpus pointed at it before being trusted.
+Now keyed on a **fingerprint** that replaces literal values, so `WHERE id = 5`
+and `WHERE id = 6` share one entry:
+
+| the gateway sees | before | after |
+|---|---:|---:|
+| same shape, different values (psycopg2) | 0.32 ms | **0.008 ms** |
+| a shape never seen before | 0.36 ms | 0.36 ms |
+| the identical statement again | 0.001 ms | 0.008 ms |
+
+The last row is a real cost, stated rather than buried: every lookup now
+computes a fingerprint, 6.6 µs of it. That is ~125× inside the NFR-2 budget and
+invisible against a network round trip, and it buys a 40× improvement on the
+case that was actually bad. A second cache layer to recover those 7 µs was
+considered and rejected — this is the module where a wrong answer means a wrong
+verdict, and it should stay easy to reason about.
+
+**Why blanking literals is not enough, and what is done instead.** Of everything
+the policy engine reads, exactly one field depends on literal values —
+`filter_is_tautology` — and it is the field deciding whether `WHERE 1 = 1` is a
+filter or a table-wide write:
+
+```
+WHERE 1 = 1      tautology      -> behaves as unfiltered
+WHERE 1 = 2      not a tautology -> an ordinary filter
+```
+
+Blank the literals and those become the same key, so whichever arrived first
+would answer for the other — a statement touching every row could inherit
+"allowed" from one matching nothing. The rule is therefore not "normalise
+literals" but: **normalise only when no literal is compared against another
+literal; otherwise use the statement verbatim.** A literal compared to a column
+cannot form a tautology; a literal compared to a literal is exactly that case,
+and those statements keep their exact text as the key. Being wrong here costs a
+verdict; declining to normalise costs a cache entry.
+
+Held to one invariant — *if two statements share a fingerprint they must get the
+same verdict* — checked against the same differential corpus the analysis
+backends use, with every literal mutated, plus the adversarial pairs designed to
+break it and an end-to-end test that a tautology is still refused after a
+near-identical safe statement was allowed.
 
 ## 12. Decisions taken at review
 

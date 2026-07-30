@@ -355,18 +355,14 @@ def test_capture_overhead_on_postgres(benchmark):
         admin.close()
 
 
-def test_the_cost_when_every_statement_is_new(benchmark):
-    """The workload the memoised number does not describe.
+def test_the_cost_when_only_the_values_change(benchmark):
+    """The psycopg2 shape: same statement, different literals, every time.
 
-    The cache is keyed on exact statement text. psycopg2 interpolates
-    parameters client-side, so `WHERE id = 5` and `WHERE id = 6` arrive as
-    different statements and never share an entry -- for those clients the cold
-    path *is* the hot path. That is not a hypothetical: psycopg2 is one of the
-    two clients this project's own gateway tests drive.
-
-    Restating NFR-2 around "real traffic repeats itself" without this number
-    would have been true of parameterised clients and quietly false of a very
-    large installed base.
+    This used to be the expensive case. The cache keyed on exact text and
+    psycopg2 interpolates parameters client-side, so `WHERE id = 5` and
+    `WHERE id = 6` never shared an entry and every statement paid a full parse
+    -- 0.32 ms. Keying on a fingerprint that ignores literal values (but never
+    where they could change the verdict) collapses them to one entry.
     """
     from ctrlz.gateway import Interceptor, protocol
 
@@ -388,25 +384,54 @@ def test_the_cost_when_every_statement_is_new(benchmark):
         timings.append((time.perf_counter() - start) * 1000)
 
     recorded = benchmark.record(
-        "gateway interceptor (all new)",
-        "a client that inlines literals, e.g. psycopg2", timings,
+        "gateway, values differ", "psycopg2-shaped traffic", timings,
         budget_ms=BUDGET_MS,
     )
-    # The 1 ms budget, not the complex-SQL one: inlined-literal traffic is
-    # ordinary DML, and NFR-2 holds the ordinary case to the original number
-    # rather than leaning on a cache these clients never hit.
-    #
-    # Asserted on the median, with p99 as a looser tripwire, because that is
-    # the methodology NFR-2 itself now states: runs of this suite on a busy
-    # container have produced p99s of 11 ms and 27 ms for code that measures
-    # 1.2 ms on a quiet one. Those are the scheduler. Writing a strict p99
-    # assertion here would have contradicted the note in the spec and flaked
-    # for the reason that note gives.
+    assert len(interceptor._cache) == 1, (
+        f"{len(interceptor._cache)} cache entries for one statement shape -- "
+        f"the fingerprint is not collapsing literal values"
+    )
     assert recorded.median_ms < BUDGET_MS, (
-        f"a cache-missing ordinary statement costs {recorded.median_ms:.3f} ms "
-        f"at the median, over the {BUDGET_MS} ms NFR-2 allows"
+        f"{recorded.median_ms:.3f} ms median, over the {BUDGET_MS} ms budget"
+    )
+
+
+def test_the_cost_of_a_shape_never_seen_before(benchmark):
+    """The genuinely cold case, now that changing values no longer is one.
+
+    Every statement here has a different *shape* -- different table, different
+    columns -- so no fingerprint can help and each one is a real parse. This is
+    the number NFR-2's first-sight budget is about, and it is what a workload
+    with a very large number of distinct queries actually pays.
+    """
+    from ctrlz.gateway import Interceptor, protocol
+
+    interceptor = Interceptor(tracked=("users", "orders"))
+    shapes = [
+        protocol.Message(
+            protocol.QUERY,
+            f"UPDATE table_{n} SET col_{n} = 1 WHERE key_{n} = 2\x00".encode(),
+        )
+        for n in range(400)
+    ]
+    for message in shapes[:20]:
+        interceptor.inspect(message)
+
+    timings: list[float] = []
+    for message in shapes[20:]:
+        start = time.perf_counter()
+        interceptor.inspect(message)
+        timings.append((time.perf_counter() - start) * 1000)
+
+    recorded = benchmark.record(
+        "gateway, shape is new", "a statement never seen in any form", timings,
+        budget_ms=BUDGET_MS,
+    )
+    assert recorded.median_ms < BUDGET_MS, (
+        f"a novel statement shape costs {recorded.median_ms:.3f} ms at the "
+        f"median, over the {BUDGET_MS} ms NFR-2 allows"
     )
     assert recorded.p99_ms < BUDGET_MS * 5, (
-        f"p99 {recorded.p99_ms:.3f} ms is far enough over the {BUDGET_MS} ms "
-        f"budget to be a regression rather than a noisy machine"
+        f"p99 {recorded.p99_ms:.3f} ms is far enough over to be a regression "
+        f"rather than a noisy machine"
     )
