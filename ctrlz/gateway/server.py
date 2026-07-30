@@ -16,13 +16,24 @@ What it deliberately does not do:
   (D2.4). The cost, stated rather than hidden: we cannot learn the
   authenticated identity, so attribution uses the startup packet's ``user``
   and ``application_name``.
-* **It does not terminate TLS from the client.** It must read SQL, so it
-  answers ``SSLRequest`` with a decline and proceeds in plaintext. Bind it to
-  localhost or a trusted segment. The *upstream* hop is separate and does
-  honour ``sslmode`` in the upstream DSN, including certificate verification
-  under ``verify-full``.
 * **It is not required for undo.** Capture lives inside the database. Stop the
   gateway and every change is still recorded and still reversible.
+
+The two hops are configured separately and mean different things. The client
+hop is secured by giving the gateway a certificate (``ServerTLS``); without
+one it declines ``SSLRequest`` and runs in plaintext, which is only reasonable
+on localhost or a trusted segment. The database hop honours ``sslmode`` in the
+upstream DSN.
+
+Encrypting **both** hops does not work, and the gateway refuses to start in
+that configuration rather than let it fail later at authentication. The reason
+is worth stating plainly: an encrypted upstream makes PostgreSQL offer
+``SCRAM-SHA-256-PLUS``, whose whole purpose is to bind authentication to one
+specific TLS session so that a man-in-the-middle cannot relay it. There are two
+TLS sessions here and the gateway is the thing in the middle, so the binding
+data cannot match. That is channel binding working exactly as designed against
+exactly the thing it was designed against. See ``strip_channel_binding`` for
+the one deliberate way out.
 """
 
 from __future__ import annotations
@@ -39,6 +50,7 @@ from ..actor import GATEWAY, Actor
 from ..policy import Policy
 from . import protocol
 from .interceptor import Interceptor
+from .tls import ServerTLS, TLSConfigError
 
 log = logging.getLogger("ctrlz.gateway")
 
@@ -133,26 +145,76 @@ class Gateway:
         tracked: tuple[str, ...] = (),
         environment: str = "default",
         attribute: bool = True,
+        tls: Optional[ServerTLS] = None,
+        require_tls: bool = False,
+        strip_channel_binding: bool = False,
     ):
         self.upstream = upstream
         self.interceptor = Interceptor(
             policy=policy, tracked=tracked, environment=environment
         )
         self.attribute = attribute
+        self.tls = tls
+        self.require_tls = require_tls
+        self.strip_channel_binding = strip_channel_binding
         self.stats = Stats()
+        self._tls_context: Optional[ssl.SSLContext] = None
         self._server: Optional[asyncio.AbstractServer] = None
         self._sessions: set[asyncio.Task] = set()
+
+        if require_tls and tls is None:
+            raise TLSConfigError(
+                "--require-tls refuses every plaintext client, and without a "
+                "certificate there is no encrypted alternative to offer, so no "
+                "client could connect at all. Supply a certificate and key."
+            )
+        if tls is not None and upstream.wants_tls and not strip_channel_binding:
+            # Refused here, at configuration time, rather than left to fail at
+            # authentication -- where the error surfaces on the client and says
+            # nothing about the gateway that caused it.
+            raise TLSConfigError(
+                f"both hops cannot be encrypted: a client certificate is "
+                f"configured and the upstream DSN says sslmode="
+                f"{upstream.sslmode}.\n"
+                f"  PostgreSQL will offer SCRAM-SHA-256-PLUS, whose channel "
+                f"binding ties authentication to one TLS session. There are two "
+                f"here, so clients will fail to authenticate.\n"
+                f"  Encrypt the hop that crosses untrusted network and leave the "
+                f"other plaintext -- usually: keep the certificate, set "
+                f"sslmode=disable upstream.\n"
+                f"  If both hops genuinely must be encrypted, "
+                f"--strip-channel-binding removes SCRAM-SHA-256-PLUS from the "
+                f"server's offer. Read what that costs before using it."
+            )
 
     # -- lifecycle ---------------------------------------------------------
 
     async def start(self, host: str = "127.0.0.1", port: int = 6543) -> int:
+        # Load certificates before binding the port. A path that does not
+        # resolve should fail while somebody is still watching the terminal,
+        # not on the first connection an hour later.
+        self.reload_tls()
+
         self._server = await asyncio.start_server(self._handle, host, port)
         bound = self._server.sockets[0].getsockname()[1]
         log.info(
             "ctrlz gateway listening on %s:%s -> %s:%s",
             host, bound, self.upstream.host, self.upstream.port,
         )
-        if self.upstream.wants_tls:
+        if self.tls is not None:
+            log.info(
+                "client connections may use TLS (%s)%s",
+                self.tls.describe(),
+                "; plaintext refused" if self.require_tls else "",
+            )
+        else:
+            log.warning(
+                "client connections are plaintext: no certificate configured, "
+                "so SSLRequest is declined and SQL and credentials cross the "
+                "network in the clear. Bind to localhost or a trusted segment, "
+                "or pass --tls-cert and --tls-key."
+            )
+        if self.upstream.wants_tls and self.tls is None:
             log.warning(
                 "upstream sslmode=%s encrypts the database hop while the client "
                 "hop stays plaintext. If the server offers SCRAM-SHA-256-PLUS, "
@@ -160,7 +222,36 @@ class Gateway:
                 "to stop proxies, and this is one.",
                 self.upstream.sslmode,
             )
+        if self.strip_channel_binding:
+            log.warning(
+                "--strip-channel-binding is on: SCRAM-SHA-256-PLUS is being "
+                "removed from the server's offer, so clients authenticate "
+                "without binding the exchange to their TLS session. Both hops "
+                "stay encrypted; what is given up is the proof that nothing "
+                "sits between them -- and something does. This one."
+            )
         return bound
+
+    def reload_tls(self) -> None:
+        """Rebuild the TLS context from the files on disk.
+
+        Certificates expire, and the ones that do not expire get rotated. A
+        proxy in the connection path that can only pick up a renewal by
+        restarting drops every open session to do it, every sixty days.
+
+        The new context is built first and swapped in only if it loads, so a
+        reload with a half-written file leaves the running one serving.
+        Connections already established keep the context they started with;
+        that is how TLS works, and pretending otherwise would be worse.
+        """
+        if self.tls is None:
+            self._tls_context = None
+            return
+        context = self.tls.context()      # raises before anything is replaced
+        replacing = self._tls_context is not None
+        self._tls_context = context
+        if replacing:
+            log.info("TLS certificate reloaded (%s)", self.tls.describe())
 
     async def serve_forever(self) -> None:
         assert self._server is not None
@@ -204,9 +295,12 @@ class Gateway:
         self.stats.connections += 1
         server_writer: Optional[asyncio.StreamWriter] = None
         try:
-            startup = await self._negotiate(client_reader, client_writer)
-            if startup is None:
+            negotiated = await self._negotiate(client_reader, client_writer)
+            if negotiated is None:
                 return
+            # A TLS upgrade replaces the stream pair, so rebind rather than
+            # carry on writing to the plaintext one.
+            startup, client_reader, client_writer = negotiated
 
             server_reader, server_writer = await self._connect_upstream()
 
@@ -301,19 +395,88 @@ class Gateway:
 
     async def _negotiate(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> Optional[protocol.StartupPacket]:
-        """Read the startup packet, declining TLS if it is offered."""
+    ) -> Optional[tuple[protocol.StartupPacket, asyncio.StreamReader,
+                        asyncio.StreamWriter]]:
+        """Read the startup packet, upgrading to TLS if both sides want it.
+
+        Returns the reader and writer to carry on with, because after a TLS
+        upgrade they are not the ones we were handed.
+        """
+        encrypted = False
         while True:
             packet = await self._read_startup(reader)
             if packet is None:
                 return None
-            if packet.is_ssl_request or packet.is_gssenc_request:
-                # We have to read SQL, so we cannot pass an encrypted stream
-                # through. Decline and let the client retry in plaintext.
+
+            if packet.is_gssenc_request:
+                # GSSAPI encryption is a separate mechanism we do not speak.
+                # Declining is the protocol's own way of saying so, and the
+                # client falls back without an error.
                 writer.write(protocol.SSL_DECLINED)
                 await writer.drain()
                 continue
-            return packet
+
+            if packet.is_ssl_request:
+                if self._tls_context is None:
+                    writer.write(protocol.SSL_DECLINED)
+                    await writer.drain()
+                    continue
+                reader, writer = await self._accept_tls(reader, writer)
+                if writer is None:
+                    return None
+                encrypted = True
+                continue
+
+            if self.require_tls and not encrypted and not packet.is_cancel_request:
+                # hostssl: the client asked to speak in the clear and this
+                # gateway does not. Say so in a message a client will render,
+                # rather than dropping the socket and leaving them guessing.
+                writer.write(
+                    protocol.error_response(
+                        "this ctrlz gateway requires TLS",
+                        detail="the connection was attempted without encryption",
+                        hint="connect with sslmode=require (or higher)",
+                    )
+                )
+                await writer.drain()
+                log.info("refused a plaintext connection (--require-tls)")
+                return None
+
+            return packet, reader, writer
+
+    async def _accept_tls(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
+        """Answer SSLRequest with 'S' and upgrade the socket in place.
+
+        PostgreSQL does not do TLS on connect: the request arrives in the clear
+        and a single byte answers it, after which both sides start a handshake
+        on the same socket. asyncio has no stream-level API for that, so the
+        transport is swapped underneath the reader and writer -- the mirror of
+        what `_connect_upstream` does on the other side.
+        """
+        writer.write(protocol.SSL_ACCEPTED)
+        await writer.drain()
+
+        transport = writer.transport
+        protocol_obj = transport.get_protocol()
+        loop = asyncio.get_running_loop()
+        try:
+            new_transport = await loop.start_tls(
+                transport, protocol_obj, self._tls_context, server_side=True
+            )
+        except (ssl.SSLError, ConnectionResetError, asyncio.IncompleteReadError) as exc:
+            # A failed handshake is the client's business -- a bad certificate,
+            # no certificate where one is required, a version floor they cannot
+            # meet. It is not a gateway fault and must not take the server down.
+            log.info("TLS handshake with a client failed: %s", exc)
+            _close(writer)
+            return reader, None
+
+        protocol_obj._stream_reader._transport = new_transport
+        writer._transport = new_transport
+        _no_half_close(protocol_obj)
+        return reader, writer
 
     async def _read_startup(
         self, reader: asyncio.StreamReader
@@ -377,6 +540,16 @@ class Gateway:
                     released = False
                     for message in reader.messages():
                         if message.tag != protocol.READY_FOR_QUERY:
+                            if self.strip_channel_binding:
+                                message, stripped = protocol.without_channel_binding(
+                                    message
+                                )
+                                if stripped:
+                                    log.info(
+                                        "removed SCRAM-SHA-256-PLUS from the "
+                                        "server's offer for %s",
+                                        actor.user or "an unnamed user",
+                                    )
                             client_writer.write(message.encode())
                             continue
                         await client_writer.drain()
@@ -508,6 +681,29 @@ def _literal(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _no_half_close(protocol_obj) -> None:
+    """Stop asyncio warning once per TLS connection about a half-close.
+
+    ``StreamReaderProtocol.eof_received`` returns True, meaning "the peer is
+    done writing but keep the transport open, I may still write". TLS has no
+    half-close, so asyncio logs a warning and closes anyway -- every time a TLS
+    session ends. Harmless, and a warning per connection is the kind of noise
+    that gets a logger turned off, taking the useful messages with it.
+
+    Returning False is also what we actually mean: when one side of a proxied
+    session goes away, the session is over. The reader must still be told about
+    the EOF, so the original is called for its effect and only the answer
+    changes.
+    """
+    original = protocol_obj.eof_received
+
+    def eof_received() -> bool:
+        original()
+        return False
+
+    protocol_obj.eof_received = eof_received
+
+
 def _close(writer: Optional[asyncio.StreamWriter]) -> None:
     if writer is None:
         return
@@ -523,6 +719,9 @@ async def run_gateway(
     policy: Optional[Policy] = None,
     tracked: tuple[str, ...] = (),
     environment: str = "default",
+    tls: Optional[ServerTLS] = None,
+    require_tls: bool = False,
+    strip_channel_binding: bool = False,
 ) -> None:
     host, _, port = listen.rpartition(":")
     gateway = Gateway(
@@ -530,6 +729,36 @@ async def run_gateway(
         policy=policy,
         tracked=tracked,
         environment=environment,
+        tls=tls,
+        require_tls=require_tls,
+        strip_channel_binding=strip_channel_binding,
     )
     await gateway.start(host or "127.0.0.1", int(port or 6543))
+    _reload_on_sighup(gateway)
     await gateway.serve_forever()
+
+
+def _reload_on_sighup(gateway: Gateway) -> None:
+    """Reload certificates on SIGHUP, the convention every server already uses.
+
+    Without it a renewal costs a restart, and a restart in the connection path
+    costs every open session. Best effort: a platform with no SIGHUP, or a loop
+    that will not take a signal handler, loses the convenience and nothing else.
+    """
+    if gateway.tls is None:
+        return
+    import signal
+
+    def reload() -> None:
+        try:
+            gateway.reload_tls()
+        except TLSConfigError as exc:
+            # Keep serving with the certificate we have. A failed reload is a
+            # bad deploy, not a reason to stop answering.
+            log.error("TLS reload failed, keeping the previous certificate: %s", exc)
+
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGHUP, reload)
+        log.info("send SIGHUP to reload the TLS certificate")
+    except (NotImplementedError, AttributeError, ValueError):
+        pass

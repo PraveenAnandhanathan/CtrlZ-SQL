@@ -36,8 +36,10 @@ SSL_REQUEST = 80877103
 CANCEL_REQUEST = 80877102
 GSSENC_REQUEST = 80877104
 
-#: Sent in reply to SSLRequest to decline TLS between client and gateway.
+#: Sent in reply to SSLRequest. One byte, before any framing exists: 'S' begins
+#: a TLS handshake on the same socket, 'N' carries on in the clear.
 SSL_DECLINED = b"N"
+SSL_ACCEPTED = b"S"
 
 #: SQLSTATE for a statement we refused. 42501 is insufficient_privilege, which
 #: is what a refusal by policy actually is, and clients already understand it.
@@ -171,6 +173,49 @@ def _cstring(payload: bytes, offset: int) -> tuple[bytes, int]:
 
 def _text(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
+
+
+#: Sub-type of an Authentication ('R') message announcing SASL, followed by the
+#: mechanisms the server will accept as a list of null-terminated strings.
+AUTH_SASL = 10
+
+#: The SCRAM variant that binds authentication to a specific TLS session.
+CHANNEL_BINDING_MECHANISM = b"SCRAM-SHA-256-PLUS"
+
+
+def sasl_mechanisms(message: Message) -> Optional[list[bytes]]:
+    """The mechanisms offered by an AuthenticationSASL message, or None."""
+    if message.tag != AUTHENTICATION or len(message.payload) < 4:
+        return None
+    if struct.unpack("!I", message.payload[:4])[0] != AUTH_SASL:
+        return None
+    body = message.payload[4:]
+    return [name for name in body.split(b"\x00") if name]
+
+
+def without_channel_binding(message: Message) -> tuple[Message, bool]:
+    """Remove SCRAM-SHA-256-PLUS from a SASL offer.
+
+    Returns the message to send and whether anything was removed, so the caller
+    can log a downgrade it performed rather than leave it invisible.
+
+    If stripping would leave no mechanisms at all -- a server configured to
+    accept only channel binding -- the offer is passed through untouched. An
+    empty list is not a weaker negotiation, it is a broken message, and turning
+    a refusal we understand into a parse error the client cannot explain would
+    be strictly worse.
+    """
+    offered = sasl_mechanisms(message)
+    if not offered or CHANNEL_BINDING_MECHANISM not in offered:
+        return message, False
+
+    kept = [name for name in offered if name != CHANNEL_BINDING_MECHANISM]
+    if not kept:
+        return message, False
+
+    payload = struct.pack("!I", AUTH_SASL)
+    payload += b"".join(name + b"\x00" for name in kept) + b"\x00"
+    return Message(AUTHENTICATION, payload), True
 
 
 # -- encoding ---------------------------------------------------------------

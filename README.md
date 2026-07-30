@@ -226,32 +226,69 @@ to render it.
 |---|---|
 | **No connection pooling** | one upstream connection per client. Multiplexing sessions would break `SET LOCAL`, temp tables and transactions in ways that are hard to see and impossible to explain |
 | **No credential handling** | authentication is relayed verbatim, which is exactly why `md5` and SCRAM work. The cost: we cannot learn the authenticated identity, so attribution uses the startup packet's `user` and `application_name` |
-| **No TLS from the client** | it must read SQL, so it declines `SSLRequest`. **Bind it to localhost or a trusted segment** |
-| **Upstream TLS is off by default** | not libpq's default, and deliberately so — see below |
+| **No connection multiplexing** | see above |
 | **Not required for undo** | capture lives inside the database. Stop the gateway and every change is still recorded and still reversible |
 
-### Upstream TLS and channel binding
+### TLS
 
-`?sslmode=` on the upstream DSN is honoured for the gateway-to-database hop —
-`require`, `verify-ca` and `verify-full` all work, and only `verify-full`
-checks the hostname, exactly as libpq defines them.
+The two hops are configured separately, because they are different trust
+decisions. The **client** hop is usually the one crossing untrusted network;
+the **database** hop is usually the near one.
 
-It defaults to `disable` rather than libpq's `prefer`, and the reason is worth
-knowing before you change it. If the database hop is encrypted while the client
-hop is not, PostgreSQL offers **SCRAM-SHA-256-PLUS** — channel binding — because
-from its side the connection is protected. The gateway relays that challenge to
-a client on a plaintext socket, and the client correctly refuses:
+```bash
+ctrlz gateway --listen 0.0.0.0:6543 \
+  --upstream postgresql://localhost/app \
+  --tls-cert /etc/ctrlz/server.crt \
+  --tls-key  /etc/ctrlz/server.key \
+  --require-tls
+```
+
+| flag | effect |
+|---|---|
+| `--tls-cert` / `--tls-key` | serve TLS to clients. Without them `SSLRequest` is declined and everything is plaintext |
+| `--require-tls` | refuse plaintext clients — the `hostssl` equivalent. The refusal is a rendered error, not a dropped socket |
+| `--tls-ca` | verify client certificates against this CA (mutual TLS) |
+| `--require-client-cert` | reject clients presenting none. Needs `--tls-ca`, and says so if you forget |
+| `--tls-allow-insecure-key` | permit a group- or world-readable private key |
+
+A private key other users can read is **refused**, exactly as PostgreSQL
+refuses to start with one. TLS 1.2 is the floor. Certificates load before the
+port binds, so a bad path fails while you are watching. **`SIGHUP` reloads
+them** — a certificate renewal should not cost every open session, and a
+reload that fails keeps the running certificate rather than ending the service.
+
+`?sslmode=` on the upstream DSN is honoured for the database hop — `require`,
+`verify-ca` and `verify-full` all work, and only `verify-full` checks the
+hostname, exactly as libpq defines them.
+
+### Why you cannot encrypt both hops
+
+The gateway **refuses to start** if you configure a client certificate *and* an
+encrypted upstream. Not an oversight — the alternative is a configuration that
+starts cleanly and then fails at authentication with a client-side error that
+never mentions the gateway.
+
+An encrypted upstream makes PostgreSQL offer **SCRAM-SHA-256-PLUS**, whose
+channel binding ties the authentication exchange to one specific TLS session so
+that a man-in-the-middle cannot relay it. There are two TLS sessions here and
+the gateway is the thing in the middle, so the binding data cannot match:
 
 ```
 server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection
 ```
 
-That is channel binding working exactly as designed. It exists to stop a
-man-in-the-middle from relaying an authentication exchange, and a proxy that
-reads your SQL *is* a man-in-the-middle. No amount of care on our side changes
-that. The honest options are to leave both hops in the same state (the default),
-or to secure the client hop too — which needs a certificate and is not something
-to half-build. The gateway logs a warning when you enable upstream TLS.
+That is channel binding working exactly as designed, against exactly the thing
+it was designed against. **Encrypt the hop that crosses untrusted network and
+leave the other plaintext** — usually: keep the certificate, `sslmode=disable`
+upstream.
+
+If both hops genuinely must be encrypted, `--strip-channel-binding` removes
+SCRAM-SHA-256-PLUS from the server's offer so clients fall back to plain
+SCRAM-SHA-256. Both hops stay encrypted and the password is still never sent in
+clear; what you give up is the proof that nothing sits between client and
+database — and something does. This. It is opt-in, it logs a warning at
+startup and on every downgrade, and if stripping would leave the server with no
+mechanisms at all the offer is passed through untouched.
 
 ### It fails open, always
 
@@ -262,9 +299,28 @@ we failed to judge is still a statement we can undo. There is a fault-injection
 test that forces evaluation to raise on every statement and asserts the client
 still completes its work.
 
-Measured overhead per statement: **0.26 ms** first sight, **0.0015 ms** for a
-statement already seen (verdicts are memoised because analysis is pure), against
-a 1 ms budget.
+### What it costs you
+
+Published on every CI build, not estimated. Medians; see NFR-2 in
+[`spec/spec.md`](./spec/spec.md) for p99s and why a p99 from a shared runner is
+an upper bound on the machine rather than a property of the code.
+
+| the gateway sees | added per statement |
+|---|---|
+| a statement it has judged before | **0.001 ms** |
+| ordinary DML, first sight | **0.31 ms** |
+| a CTE or a large join, first sight | **0.83 ms** |
+
+Verdicts are memoised, because analysis is pure. The cache keys on exact
+statement text, so **which row you get depends on your driver**: parameterised
+clients (psycopg3, JDBC) send `WHERE id = $1` once and land in row one, while
+drivers that interpolate client-side — psycopg2 among them — send `WHERE id = 5`
+then `WHERE id = 6` and land in row two every time. Row two is the number to
+plan against if you are not sure, and it is still comfortably inside budget.
+
+Capture is separate and costs **1.2×–1.5× a plain write** on a tracked table.
+The ratio is worse on faster storage, because a trigger's cost is roughly fixed
+while the write beneath it gets cheaper — plan against 1.5×.
 
 ## For applications that cannot be re-pointed
 
@@ -544,8 +600,12 @@ Beyond that:
 - a **fault-injection test** proving the gateway fails open;
 - an **agreement test** asserting the gateway, the SDK and the CLI reach
   identical verdicts;
-- **benchmarks** asserting the analysis budget (measured: 0.25 ms median,
-  0.46 ms p99 for parse plus policy; 0.0015 ms for a repeated statement).
+- **benchmarks that publish their numbers** into the CI job summary rather than
+  asserting a budget and discarding the measurement — a budget that is only
+  asserted tells you nothing collapsed, not what the thing costs or which way it
+  has been moving. Both NFR-1 (capture overhead) and NFR-2 (gateway overhead)
+  are measured on every build, on two engines, and the figures in this README
+  come from them.
 
 ## License
 

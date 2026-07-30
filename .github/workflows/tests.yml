@@ -63,6 +63,13 @@ jobs:
           CTRLZ_REQUIRE_ENGINES: postgres,mysql
         run: pytest -q
 
+      - name: Publish the benchmark numbers
+        # Spec §10.6: benchmarks must run in CI *and publish numbers*. Asserting
+        # a budget only says nothing collapsed; the numbers say what it costs
+        # and which way that is moving. They land in the job summary.
+        if: matrix.python == '3.12'
+        run: pytest tests/test_benchmark.py -q -p no:warnings
+
       - name: Check the package installs and runs from a built wheel
         # Everything above runs from a source checkout with dev extras. What a
         # user actually gets is the wheel, and only this step tests that -- the
