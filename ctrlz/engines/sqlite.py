@@ -157,6 +157,22 @@ class SQLiteEngine(Engine):
     def _quote(name: str) -> str:
         return '"' + name.replace('"', '""') + '"'
 
+    @staticmethod
+    def _literal(value: str) -> str:
+        """A SQL string literal, for names that end up *inside* quotes.
+
+        Column and table names reach the trigger body twice: as identifiers,
+        which `_quote` handles, and as JSON keys and log values, which are
+        string literals. The second path was interpolating the raw name, so a
+        column legitimately called ``it's`` broke `track`, and one called
+        ``a', 'x`` got its text into the generated trigger.
+
+        SQLite does not treat backslash as an escape inside string literals, so
+        doubling the quote is the whole job here. MySQL is not so lucky -- see
+        its own `_literal`.
+        """
+        return "'" + str(value).replace("'", "''") + "'"
+
     # -- lifecycle ---------------------------------------------------------
 
     def is_initialized(self) -> bool:
@@ -288,7 +304,7 @@ class SQLiteEngine(Engine):
         for name in self._column_names(table):
             ref = f"{alias}.{self._quote(name)}"
             parts.append(
-                f"'{name}', CASE WHEN typeof({ref}) = 'blob' "
+                f"{self._literal(name)}, CASE WHEN typeof({ref}) = 'blob' "
                 f"THEN json_object('{BLOB_KEY}', hex({ref})) ELSE {ref} END"
             )
         return "json_object(" + ", ".join(parts) + ")"
@@ -298,7 +314,7 @@ class SQLiteEngine(Engine):
         for name in identity:
             ref = f"{alias}.{self._quote(name)}" if name != "rowid" else f"{alias}.rowid"
             parts.append(
-                f"'{name}', CASE WHEN typeof({ref}) = 'blob' "
+                f"{self._literal(name)}, CASE WHEN typeof({ref}) = 'blob' "
                 f"THEN json_object('{BLOB_KEY}', hex({ref})) ELSE {ref} END"
             )
         return "json_object(" + ", ".join(parts) + ")"
@@ -354,7 +370,7 @@ class SQLiteEngine(Engine):
 
                     INSERT INTO ctrlz_change_log
                         (op_id, table_name, action, identity, before, after)
-                    SELECT c.op_id, '{table}', '{action[0]}',
+                    SELECT c.op_id, {self._literal(table)}, '{action[0]}',
                            {ident_expr}, {before}, {after}
                       FROM ctrlz_current_op c
                      WHERE c.id = 1

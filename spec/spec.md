@@ -480,6 +480,38 @@ The specification is satisfied when all of the following hold:
 | Capture write amplification | production write latency | benchmark; per-table opt-in; documented limits |
 | MySQL trigger limitations (no `AFTER` on some engines, no DDL triggers) | FR-5 partially unmet | treat as a finding; document rather than paper over |
 | Central store becomes a perceived source of truth | undo run against stale data | undo only ever executes against the source DB (FR-6.4) |
+| Generated trigger SQL is an injection surface | attacker-chosen text in a trigger a privileged user creates | identifiers *and* literals escaped per engine; hostile-name suite on all three (found in a pre-release audit, §11) |
+
+### Closed: generated SQL escaped identifiers but not literals
+
+Found by a pre-release audit, not by a user. Capture triggers are generated
+SQL, and a column or table name reaches the trigger body **twice**: as an
+identifier, and as a *string literal* — the JSON key naming the column, and the
+table name written to the change log. Identifier quoting was right from the
+start. The literal path interpolated the raw name.
+
+```
+column named  it's        ->  track() failed outright; a legal name
+column named  a', 'x      ->  TRACKED, with attacker-chosen text in the trigger
+```
+
+The second needs only the ability to create a table — an ordinary permission —
+plus someone with more rights running `ctrlz track --all`. Fixed by escaping
+per engine, which is not the same rule everywhere: MySQL treats backslash as an
+escape inside string literals unless `NO_BACKSLASH_ESCAPES` is set, so doubling
+the quote alone would have looked complete and left that engine exposed.
+
+**PostgreSQL was immune.** It captures with `to_jsonb(OLD)` and never names a
+column in SQL text, which is a property of that design worth having found by
+testing rather than by assuming. It is now covered by the same suite so that
+the immunity cannot quietly stop being true.
+
+The same audit found a second, lower-severity bug alongside it: a `%` in an
+identifier was re-read by the driver's parameter interpolation on both
+PostgreSQL and MySQL (`psycopg2` and `pymysql` both apply `%`-formatting to the
+rendered statement, and `sql.Identifier` guards against injection, not against
+that). It crashed loudly rather than doing anything silent, and it is fixed in
+the same pass.
 
 ### Closed: the analysis cache missed for clients that inline literals
 
