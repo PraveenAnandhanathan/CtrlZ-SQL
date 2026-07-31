@@ -289,7 +289,7 @@ Replace regex pre-flight with a real parser behind a stable interface.
 |---|---|---|
 | NFR-1 | Capture overhead ≤ 2× baseline write latency on tracked tables | benchmark in CI — **met; 1.2× to 1.5×, worse on faster disks** |
 | NFR-2 | Gateway adds < 1 ms p99 per statement, whether or not it has seen it before; < 2 ms on first sight of complex analytical SQL | benchmark in CI — **met**, restated after measurement (see below) |
-| NFR-3 | Gateway failure never blocks database access | fault-injection test |
+| NFR-3 | Gateway failure never blocks database access | fault-injection test, plus a connection cap so the gateway cannot exhaust the database's own limit (§11) |
 | NFR-4 | Zero client-side changes required to use the gateway | integration test with real `psql` |
 | NFR-5 | No credentials, row values, or connection strings in logs | test asserts redaction — **now actually written; it found a leak, §11** |
 | NFR-6 | Undo is idempotent — undoing twice is refused, not applied twice | existing test |
@@ -481,6 +481,32 @@ The specification is satisfied when all of the following hold:
 | MySQL trigger limitations (no `AFTER` on some engines, no DDL triggers) | FR-5 partially unmet | treat as a finding; document rather than paper over |
 | Central store becomes a perceived source of truth | undo run against stale data | undo only ever executes against the source DB (FR-6.4) |
 | Generated trigger SQL is an injection surface | attacker-chosen text in a trigger a privileged user creates | identifiers *and* literals escaped per engine; hostile-name suite on all three (found in a pre-release audit, §11) |
+
+### Closed: the gateway could exhaust the database's connection limit
+
+The gateway opens **one upstream database connection per client**, and had no
+cap on clients. So an unbounded number of connections to the gateway became an
+unbounded number of connections to the database — and `max_connections` is a
+hard limit shared with everybody, including clients that never went near the
+gateway.
+
+That is the one outcome NFR-3 exists to prevent, reached by a route NFR-3 did
+not cover. **Failing open protects against a bug in the checkpoint; it does not
+protect against the checkpoint consuming the resource it sits in front of.**
+Worse, the upstream connection was opened before authentication finished, so
+the client doing it did not need to be able to log in.
+
+`--max-connections` (default 100) is checked *before* anything upstream is
+opened — refusing costs a client a retry, whereas connecting first and refusing
+afterwards would spend the very resource being protected. The refusal carries
+PostgreSQL's own `53300`, which pools already read as "retry later" rather than
+as fatal.
+
+`--handshake-timeout` (default 30s) is the other half. A connection that opens
+and then says nothing holds a slot the cap has already counted, so without a
+deadline a hundred silent sockets are an outage rather than a nuisance. The
+deadline covers the handshake only: an established session sitting idle between
+statements is ordinary for a database connection, and is left alone.
 
 ### Closed: a rulebook from a parent directory silently disabled the guardrails
 

@@ -290,6 +290,27 @@ database — and something does. This. It is opt-in, it logs a warning at
 startup and on every downgrade, and if stripping would leave the server with no
 mechanisms at all the offer is passed through untouched.
 
+### Limits, because it is a network daemon
+
+The gateway holds **one database connection per client**, so the number of
+clients it will serve has to be bounded or it becomes a way to use up
+`max_connections` and lock out everybody — including people connecting
+directly.
+
+```bash
+ctrlz gateway --max-connections 100 --handshake-timeout 30 ...
+```
+
+A client over the limit gets a protocol-native error carrying SQLSTATE `53300`,
+the same code PostgreSQL uses, so pools treat it as "retry shortly" rather than
+as fatal. **The check happens before any upstream connection is opened** —
+refusing costs a client a retry; refusing after connecting would spend the
+resource the cap exists to protect. Keep it below the database's own limit.
+
+The handshake timeout drops a connection that opens and then says nothing. It
+applies to the handshake only: an established session idling between statements
+is ordinary and is left alone.
+
 ### It fails open, always
 
 Any internal exception logs and forwards the statement unchanged. A bug in the
