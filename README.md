@@ -30,6 +30,284 @@ Python, or through a gateway that protects every client you already use.
 
 ---
 
+**New here?** Jump to [Getting started](#getting-started) — install, a
+sixty-second demo on a throwaway database, permissions per engine, and what to
+do when something goes wrong. The sections before it explain *how* it works and
+*why* it is built this way.
+
+---
+
+## Why you would want this
+
+| Without `ctrlz` | With `ctrlz` |
+|---|---|
+| `UPDATE` without a `WHERE` → restore last night's backup, lose today's work | `ctrlz undo` — seconds, targeted, no downtime |
+| "Who changed these 400 rows?" → nobody knows | `ctrlz log` shows the person, the ticket, the statement's risk |
+| A dangerous statement is caught in review, or never | Blocked before it runs, by a rulebook you version-control |
+| Recovery is a DBA task with a maintenance window | A developer runs one command |
+
+**It is not a backup replacement.** Backups protect you from losing the whole
+database; `ctrlz` protects you from a specific mistake you can point at. Keep
+both.
+
+---
+
+# Getting started
+
+## 1. Install
+
+Needs **Python 3.10 or newer**. Nothing needs a compiler.
+
+```bash
+pip install ctrlz-sql                # SQLite support, no extra dependencies
+pip install 'ctrlz-sql[postgres]'    # + PostgreSQL 12 or newer
+pip install 'ctrlz-sql[mysql]'       # + MySQL 8
+pip install 'ctrlz-sql[postgres,mysql]'   # both
+
+ctrlz --version                      # confirm it landed
+```
+
+Quote the brackets — `zsh` on macOS treats them as a glob and will error
+without the quotes.
+
+If you point `ctrlz` at a database whose driver is missing, it tells you which
+one to install rather than showing a traceback.
+
+## 2. Try it in sixty seconds, on nothing
+
+SQLite needs no server, so you can prove the whole loop works before touching
+anything real. This uses only Python and `ctrlz` — no other tools required:
+
+```bash
+export CTRLZ_DSN="sqlite:///demo.db"
+
+ctrlz init
+ctrlz run "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, plan TEXT)"
+ctrlz track customers
+ctrlz run "INSERT INTO customers (name, plan) VALUES ('ada','pro'),('bob','free')"
+
+# The mistake: no WHERE clause. ctrlz blocks it, so --force to insist.
+ctrlz run "UPDATE customers SET plan = 'free'" --force
+
+python -c "import sqlite3;print(sqlite3.connect('demo.db').execute('select * from customers').fetchall())"
+# [(1, 'ada', 'free'), (2, 'bob', 'free')]   <- ada's plan is wrong
+
+ctrlz undo --yes
+
+python -c "import sqlite3;print(sqlite3.connect('demo.db').execute('select * from customers').fetchall())"
+# [(1, 'ada', 'pro'), (2, 'bob', 'free')]    <- back
+```
+
+Try `ctrlz run "UPDATE customers SET plan = 'free'"` **without** `--force` first
+— that refusal is the part that saves you more often than undo does.
+
+If that works, the machinery works. Everything below is connecting it to a real
+database.
+
+### Upgrading from an earlier version
+
+Run `ctrlz init` against the existing database. Migrations are additive —
+nullable columns only, no rewrites, no backfill — so they are fast on a large
+history table and cannot lose anything. Operations captured before the upgrade
+stay undoable and show no actor, which is the honest answer. There is a test
+that builds a real v0.1 database, captures history through its triggers,
+upgrades it, and undoes a pre-upgrade change.
+
+## 3. Connect to your database
+
+Set `CTRLZ_DSN` once, or pass `--dsn` each time:
+
+```bash
+export CTRLZ_DSN="postgresql://user:password@localhost:5432/appdb"
+export CTRLZ_DSN="mysql://user:password@localhost:3306/appdb"
+export CTRLZ_DSN="sqlite:////absolute/path/app.db"     # four slashes = absolute
+export CTRLZ_DSN="sqlite:///relative.db"               # three = relative
+```
+
+`ctrlz init` prints the database it actually opened. **Read that line** — it is
+how a typo'd DSN shows up as a typo instead of as a success.
+
+## 4. Grant the right permissions
+
+`ctrlz` creates a small amount of bookkeeping and one trigger per tracked table,
+so it needs more than read/write. This is the step that most often goes wrong.
+
+### PostgreSQL
+
+```sql
+GRANT CREATE ON DATABASE appdb TO ctrlz_user;   -- for `ctrlz init` (verified)
+GRANT TRIGGER ON TABLE customers TO ctrlz_user; -- for `ctrlz track`
+-- Or simply: the tables' owner already has both.
+```
+
+`init` creates a schema called `ctrlz`; `track` creates one trigger per table.
+Nothing else is modified.
+
+### MySQL 8
+
+```sql
+GRANT TRIGGER, CREATE, SELECT, INSERT, UPDATE, DELETE ON appdb.* TO 'ctrlz_user'@'%';
+```
+
+**The gotcha that will cost you an hour.** With binary logging on — the default
+on most managed MySQL — creating a trigger fails unless the server allows it:
+
+```sql
+SET GLOBAL log_bin_trust_function_creators = 1;
+```
+
+Without it, `ctrlz track` fails with *"You do not have the SUPER privilege and
+binary logging is enabled"*. That is MySQL's rule, not ours. On RDS/Aurora it is
+a parameter-group setting rather than a statement.
+
+### SQLite
+
+Nothing. Write access to the file is the whole requirement.
+
+## 5. Choose what to protect
+
+```bash
+ctrlz track --all              # every table with a usable identity
+ctrlz track public.customers   # or one at a time
+ctrlz tracked                  # what is protected right now
+```
+
+A table needs a primary key or a `NOT NULL` unique index — without one there is
+no way to say *which* row to put back, and `ctrlz` says so rather than guessing.
+
+Capture costs about **1.2×–1.5× a plain write** on a tracked table, and stores a
+before/after copy of every changed row (see *What it keeps, and where*). Track
+the tables that would hurt to lose, not everything reflexively.
+
+## 6. Check your work before relying on it
+
+```bash
+ctrlz doctor
+```
+
+```console
+engine:      postgresql
+target:      postgresql://localhost:5432/appdb
+initialized: yes
+operations:  12 in history
+
+Protected (3 table(s))
+  public.customers  identity: id
+  public.orders     identity: id
+
+NOT protected (1 table(s))
+  public.event_log
+  Changes to these tables cannot be undone.
+
+Known limits
+  - TRUNCATE does not fire row triggers and cannot be captured.
+  - DDL is not captured; schema changes are outside the undo history.
+```
+
+**`doctor` is the honest answer to "am I covered?"** Run it before you need it.
+
+---
+
+# Everyday use
+
+```bash
+ctrlz run "UPDATE orders SET status = 'shipped' WHERE id = 42"   # run it safely
+ctrlz log                       # what has happened, and who did it
+ctrlz preview                   # what an undo would do, before doing it
+ctrlz undo --yes                # reverse the last operation
+ctrlz redo --yes                # changed your mind about the undo
+```
+
+Undo takes an id, so you are not limited to the most recent thing:
+
+```bash
+ctrlz log
+ctrlz preview 97e9ce62
+ctrlz undo 97e9ce62
+```
+
+**Always `preview` before `undo` on anything that matters.** It reports each row
+as `clean`, `drifted`, `missing` or `occupied`, and refuses rather than
+overwriting somebody else's later edit.
+
+Changes made *outside* `ctrlz` — by your application, another tool, `psql` — are
+still captured, because capture lives in the database. You do not have to route
+everything through the command line to be protected.
+
+## Three ways to use it
+
+| | Use when | What you get |
+|---|---|---|
+| **CLI** — `ctrlz run …` | Manual fixes, migrations, on-call | Guardrails, prompts, labels |
+| **Gateway** — `ctrlz gateway …` | Protecting tools you cannot change | Every client covered, no code edits |
+| **Python** — `import ctrlz` | Scripts, backfills, your app | The same checks, programmatically |
+
+```python
+import ctrlz
+
+cz = ctrlz.connect("postgresql://localhost/appdb")
+result = cz.run("UPDATE customers SET plan = 'pro' WHERE id = 7", label="upgrade")
+print(result.rowcount)
+
+if something_went_wrong:
+    cz.undo("last")
+```
+
+## Running the gateway
+
+```bash
+ctrlz gateway --listen 127.0.0.1:6543 --upstream "$CTRLZ_DSN"
+```
+
+Then point any client at port 6543 instead of the database — `psql`, DBeaver,
+your application, a BI tool. Nothing about them changes, and refused statements
+come back as ordinary database errors.
+
+**Bind it to localhost or a trusted network unless you configure TLS**
+(see *TLS* above). Stopping the gateway never stops the database, and never
+stops capture — it only removes the checkpoint.
+
+---
+
+# Platform notes
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| CLI, Python API, all three engines | ✅ | ✅ | ✅ |
+| Gateway | ✅ | ✅ | ✅ |
+| Private-key permission check | ✅ | ✅ | skipped |
+| Policy-file ownership check | ✅ | ✅ | skipped |
+| `SIGHUP` certificate reload | ✅ | ✅ | restart instead |
+
+The three skipped items are POSIX concepts. On Windows they are **not enforced**
+rather than silently faked — file ownership and mode do not mean the same thing
+there, so pretending to check them would be worse than saying we do not. Every
+other feature behaves identically.
+
+CI runs Python 3.10, 3.11 and 3.12 against PostgreSQL 16 and MySQL 8 on Linux.
+macOS and Windows are supported but not covered by automated runs — if you test
+there, that feedback is worth having.
+
+---
+
+# When something goes wrong
+
+| What you see | What it means |
+|---|---|
+| `'X' is not a database URL, and does not look like a path to a SQLite file` | The DSN was mistyped or a shell variable did not expand. `ctrlz` refuses rather than creating an empty database under that name. |
+| `postgres support needs the 'psycopg2' driver` | `pip install 'ctrlz-sql[postgres]'` |
+| `permission denied for database` | Missing `CREATE ON DATABASE` — see *Grant the right permissions*. |
+| `You do not have the SUPER privilege and binary logging is enabled` | MySQL. Set `log_bin_trust_function_creators = 1`. |
+| `<table> has no primary key…` | No way to identify a row. Add a key, or pass `--identity col1,col2`. |
+| `refusing to use the policy at …: it is owned by …` | A rulebook found by searching up the directory tree that somebody else owns. Deliberate — see *The rulebook*. |
+| `Cannot undo: rows may have been removed by a cascade` | MySQL only. InnoDB cascades bypass triggers, so those rows were never captured and `ctrlz` refuses rather than half-restoring. |
+| Undo reports `drifted` | Somebody changed the row since. Inspect it, then `--allow-conflicts` if you are sure. |
+
+`ctrlz doctor` answers most of these. `ctrlz --version` belongs in any bug
+report.
+
+---
+
 ## How it works
 
 Databases cannot reverse arbitrary SQL after the fact, so something has to
@@ -446,72 +724,6 @@ Configure with `CTRLZ_ACTOR`, `CTRLZ_TICKET`, `CTRLZ_HOST`,
 `CTRLZ_APPLICATION`, `CTRLZ_ENVIRONMENT`. All optional — resolution falls back
 to the OS user and hostname, and never fails, even on a stripped container with
 neither.
-
-## Install
-
-```bash
-pip install ctrlz-sql                # SQLite, no extra dependencies
-pip install 'ctrlz-sql[postgres]'    # PostgreSQL 12+
-pip install 'ctrlz-sql[mysql]'       # MySQL 8
-pip install 'ctrlz-sql[pg-parser]'   # optional: PostgreSQL's own SQL grammar
-```
-
-The only required dependencies are `sqlglot` and `PyYAML`, both pure Python.
-Nothing needs a compiler. `ctrlz --version` reports what you have.
-
-Point it at a database with `--dsn` or `$CTRLZ_DSN`. A URL always wins; a bare
-string is accepted as a SQLite path only when it looks like one — a separator,
-a `.db`/`.sqlite` suffix, `:memory:`, or a file already there. Anything else is
-refused by name rather than turned into a new, empty database:
-
-```
-$ ctrlz --dsn '$PROD_DSN' init      # the variable was never expanded
-ctrlz: '$PROD_DSN' is not a database URL, and does not look like a path to a
-SQLite file, so ctrlz will not create one under that name.
-```
-
-`init` and `doctor` both print the database they actually opened, so a wrong
-`--dsn` shows up immediately instead of looking like a success.
-
-### Upgrading from 0.1
-
-Run `ctrlz init` against an existing database. The migration is additive —
-nullable columns only, no rewrites, no backfill — so it is fast on a large
-history table and cannot lose anything. Operations captured before the upgrade
-stay undoable and show no actor, which is the honest answer. There is a test
-that builds a real v0.1 database, captures history through v0.1 triggers,
-upgrades it, and undoes a pre-upgrade change.
-
-## Getting started
-
-```bash
-export CTRLZ_DSN="postgresql://user@localhost/app"   # or sqlite:///app.db
-
-ctrlz init          # install the capture machinery
-ctrlz track --all   # attach triggers to every table with a usable identity
-ctrlz doctor        # see exactly what is and is not protected
-```
-
-`ctrlz doctor` is worth running before you rely on any of this:
-
-```console
-engine:      postgresql
-initialized: yes
-operations:  12 in history
-
-Protected (3 table(s))
-  public.customers  identity: id
-  public.orders     identity: id
-  public.order_items  identity: order_id, sku
-
-NOT protected (1 table(s))
-  public.event_log
-  Changes to these tables cannot be undone.
-
-Known limits
-  - TRUNCATE does not fire row triggers and cannot be captured.
-  - DDL is not captured; schema changes are outside the undo history.
-```
 
 ## Commands
 
