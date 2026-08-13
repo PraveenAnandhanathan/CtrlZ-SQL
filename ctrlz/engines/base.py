@@ -15,6 +15,20 @@ from typing import Any, Iterable, Optional
 from ..model import Change, ExecutionResult, Operation, Undoability, UndoResult
 
 
+#: Marks a blocker that `--allow-conflicts` is allowed to override.
+#:
+#: Schema drift is the one blocker a caller can legitimately decide about:
+#: they may know the column was added *after* the write, in which case there
+#: was never a value to restore. Every other blocker -- a capped operation, an
+#: already-undone one, a MySQL cascade -- means the capture is missing rows we
+#: cannot reconstruct, and no flag should talk us past that.
+SCHEMA_DRIFT_MARKER = "column(s) the capture never saw"
+
+
+def overridable(blocker: str) -> bool:
+    return SCHEMA_DRIFT_MARKER in blocker
+
+
 class Engine(abc.ABC):
     """A database ctrlz can capture from and reverse changes in."""
 
@@ -169,6 +183,59 @@ class Engine(abc.ABC):
         return f"{parsed.scheme}://{host}{port}{parsed.path}"
 
     # -- helpers -----------------------------------------------------------
+
+    def schema_drift_blockers(
+        self, changes: Iterable[Change], columns_of
+    ) -> list[str]:
+        """Refuse an undo whose captured images no longer cover the table.
+
+        Engines that name every column in the trigger body -- SQLite and MySQL
+        -- freeze that list when ``track`` runs. ``ALTER TABLE ... ADD COLUMN``
+        does not rebuild the trigger, so from that moment the images are
+        missing a column, and an undo restores everything *except* it.
+
+        That is the worst failure this project can have, and it was reported by
+        an external reviewer rather than caught here: preview said `clean`,
+        undo said it had worked, and one column silently kept its wrong value.
+        A partial restore presented as a complete one is worse than no undo at
+        all, because the user stops looking.
+
+        So the operation is blocked. It is deliberately blocked rather than
+        best-effort repaired: we cannot tell whether the column was added
+        before the write (the capture is genuinely incomplete) or after it (the
+        row never had a value to restore), and guessing between "your data is
+        fine" and "your data is not" is exactly the guess this tool exists to
+        avoid making. `--allow-conflicts` proceeds for a caller who knows which
+        case they are in.
+
+        PostgreSQL never reaches here: it captures with ``to_jsonb(OLD)``,
+        which serialises whatever columns exist when the trigger fires.
+        """
+        missing: dict[str, set] = {}
+        for change in changes:
+            image = change.before or change.after or {}
+            if not image:
+                continue
+            try:
+                live = set(columns_of(change.table_name))
+            except Exception:  # noqa: BLE001 - the table may be gone; other checks cover that
+                continue
+            absent = live - set(image)
+            if absent:
+                missing.setdefault(change.table_name, set()).update(absent)
+
+        blockers = []
+        for table, columns in sorted(missing.items()):
+            names = ", ".join(sorted(columns))
+            blockers.append(
+                f"{table} has column(s) the capture never saw ({names}) -- the "
+                f"table was altered after it was tracked, so undoing would "
+                f"restore every other column and silently leave these as they "
+                f"are. Run `ctrlz track {table}` to rebuild the trigger for "
+                f"future changes; use --allow-conflicts to reverse this one "
+                f"anyway, knowing those columns keep their current values."
+            )
+        return blockers
 
     def resolve_op_id(self, ref: str) -> str:
         """Turn a user-supplied reference into a real operation id.

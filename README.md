@@ -302,6 +302,7 @@ there, that feedback is worth having.
 | `refusing to use the policy at …: it is owned by …` | A rulebook found by searching up the directory tree that somebody else owns. Deliberate — see *The rulebook*. |
 | `Cannot undo: rows may have been removed by a cascade` | MySQL only. InnoDB cascades bypass triggers, so those rows were never captured and `ctrlz` refuses rather than half-restoring. |
 | Undo reports `drifted` | Somebody changed the row since. Inspect it, then `--allow-conflicts` if you are sure. |
+| `<table> has column(s) the capture never saw` | The table was `ALTER`ed after it was tracked, on SQLite or MySQL. Run `ctrlz track <table>` to rebuild the trigger. See below. |
 
 `ctrlz doctor` answers most of these. `ctrlz --version` belongs in any bug
 report.
@@ -801,6 +802,29 @@ everything the logger emits.
 how many — never row values — unless you pass `--include-values`, which is a
 data-governance decision and is therefore off by default rather than something
 to discover later.
+
+### Adding a column to a tracked table
+
+On **SQLite and MySQL**, the capture trigger names every column, and it is
+written when you run `track`. `ALTER TABLE ... ADD COLUMN` does not rebuild it,
+so from that moment the captured images are missing the new column.
+
+`ctrlz` detects this and **refuses the undo** rather than restoring every other
+column and leaving that one silently wrong. Re-run `ctrlz track <table>` after a
+schema change and later operations are whole again.
+
+```console
+$ ctrlz preview
+BLOCKED
+  - accounts has column(s) the capture never saw (tier) -- the table was
+    altered after it was tracked...  Run `ctrlz track accounts` to rebuild
+    the trigger for future changes; use --allow-conflicts to reverse this
+    one anyway, knowing those columns keep their current values.
+```
+
+**PostgreSQL is unaffected.** It captures with `to_jsonb(OLD)`, which
+serialises whatever columns exist when the trigger fires, so an `ALTER` is
+picked up with no help from us.
 
 ## What this does not do
 

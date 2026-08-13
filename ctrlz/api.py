@@ -49,7 +49,25 @@ def connect(
     )
 
 
+def _looks_like_a_windows_path(dsn: str) -> bool:
+    """Whether this is `C:\\...` rather than a URL with scheme `c`.
+
+    urlparse reads a drive letter as a scheme, so `C:\\data\\app.db` arrived here
+    claiming scheme "c" and was refused as an unsupported database. A single
+    letter is never a real scheme -- the shortest in use is `db2` -- so the test
+    is unambiguous and costs nothing on other platforms.
+    """
+    return (
+        len(dsn) >= 3
+        and dsn[0].isalpha()
+        and dsn[1] == ":"
+        and dsn[2] in "\\/"
+    )
+
+
 def _engine_for(dsn: str) -> Engine:
+    if _looks_like_a_windows_path(dsn):
+        return _sqlite(dsn)
     scheme = urlparse(dsn).scheme.lower()
     if scheme in ("postgres", "postgresql", "psql"):
         return _open("postgres", dsn, "psycopg2", "ctrlz-sql[postgres]")
@@ -61,6 +79,12 @@ def _engine_for(dsn: str) -> Engine:
         rest = dsn.split(":", 1)[1]
         rest = rest[2:] if rest.startswith("//") else rest
         path = rest[1:] if rest.startswith("/") else rest
+        # sqlite:///C:/data/app.db -- stripping the leading slash of an
+        # authority-less URL would otherwise leave "C:/data/app.db" as
+        # "C:/data/app.db" on POSIX and mangle it on Windows, so a drive
+        # letter is put back the way the user wrote it.
+        if _looks_like_a_windows_path(rest.lstrip("/")):
+            path = rest.lstrip("/")
         return _sqlite(path or ":memory:")
     if scheme == "file":
         return _sqlite(dsn[len("file://"):])
