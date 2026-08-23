@@ -196,6 +196,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _database_errors() -> tuple:
+    """The DBAPI error classes of whichever drivers are installed.
+
+    PEP 249 gives every driver an `Error` base, so this needs no per-driver
+    knowledge beyond the import. Built on demand rather than at import time so
+    that installing ctrlz without a database driver stays free.
+    """
+    import sqlite3
+
+    errors: list = [sqlite3.Error]
+    for module in ("psycopg2", "pymysql"):
+        try:
+            errors.append(__import__(module).Error)
+        except Exception:  # noqa: BLE001 - not installed is not a problem
+            pass
+    return tuple(errors)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -211,6 +229,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
+    except _database_errors() as exc:
+        # The database's own complaint about the user's own statement -- a typo
+        # in a table name, a type mismatch, a constraint. `psql` prints these
+        # and so should we; a Python traceback tells the user nothing they can
+        # act on and makes a mistyped query look like a crash in the tool.
+        #
+        # Terminal, not log: NFR-5 keeps statements out of *logs*, and this is
+        # the user reading back an error about something they just typed.
+        print(render.c(f"{PROG}: {str(exc).strip()}", "red"), file=sys.stderr)
+        return 1
     except CtrlzError as exc:
         print(render.c(f"{PROG}: {exc}", "red"), file=sys.stderr)
         return 1

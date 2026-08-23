@@ -61,8 +61,19 @@ def test_no_policy_anywhere_means_the_built_in_defaults(tree):
 # -- a file somebody else owns is refused -----------------------------------
 
 
-@pytest.mark.skipif(os.name != "posix", reason="ownership is a POSIX concept")
-@pytest.mark.skipif(os.getuid() != 0, reason="need root to create a foreign-owned file")
+#: `os.getuid` does not exist on Windows, and a skipif decorator is evaluated
+#: at import time -- so calling it directly made this module fail to *collect*
+#: on Windows, which took the entire suite down with it. Anything platform
+#: specific in a marker has to be resolved defensively.
+NOT_POSIX = os.name != "posix"
+NOT_ROOT = NOT_POSIX or getattr(os, "getuid", lambda: 1)() != 0
+
+needs_foreign_owner = pytest.mark.skipif(
+    NOT_ROOT, reason="need POSIX and root to create a file owned by someone else"
+)
+
+
+@needs_foreign_owner
 def test_a_policy_owned_by_someone_else_is_refused(tree):
     """The case the check exists for.
 
@@ -84,8 +95,7 @@ def test_a_policy_owned_by_someone_else_is_refused(tree):
     assert "CTRLZ_POLICY" in message        # names the way to consent
 
 
-@pytest.mark.skipif(os.name != "posix", reason="ownership is a POSIX concept")
-@pytest.mark.skipif(os.getuid() != 0, reason="need root to create a foreign-owned file")
+@needs_foreign_owner
 def test_naming_the_file_explicitly_is_consent(tree, monkeypatch):
     """`$CTRLZ_POLICY` bypasses the check, because asking for a specific file
     by name is a decision rather than an accident."""
@@ -116,7 +126,7 @@ def test_the_ownership_check_is_reachable(tmp_path, monkeypatch):
         result = real_stat(self, *args, **kwargs)
         if self == policy:
             class Faked:
-                st_uid = os.getuid() + 1000
+                st_uid = getattr(os, 'getuid', lambda: 1000)() + 1000
             return Faked()
         return result
 

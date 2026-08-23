@@ -76,7 +76,7 @@ from ..model import (
     UndoResult,
 )
 from ..ordering import order_verdicts, topological_rank
-from .base import Engine
+from .base import Engine, overridable
 
 #: Marker for a value JSON cannot hold. MySQL refuses binary strings in
 #: JSON_OBJECT outright, so they are base64'd on the way in.
@@ -768,6 +768,7 @@ class MySQLEngine(Engine):
         if not changes and not op.capped:
             blockers.append("No captured changes -- nothing to undo.")
         blockers.extend(self._cascade_blockers(changes))
+        blockers.extend(self.schema_drift_blockers(changes, self._column_names))
 
         freed = {
             (c.table_name, _key(c.identity)): c.after for c in changes if c.action == INSERT
@@ -792,8 +793,16 @@ class MySQLEngine(Engine):
         self, op_id: str, allow_conflicts: bool = False, label: Optional[str] = None
     ) -> UndoResult:
         assessment = self.assess(op_id)
-        if assessment.blockers:
-            raise NotUndoable("; ".join(assessment.blockers))
+        # --allow-conflicts speaks past schema drift and nothing else. The
+        # caller may know the column was added after the write, so there was
+        # never a value to restore; they cannot know that rows lost to a
+        # cascade are recoverable, because they are not.
+        fatal = [
+            b for b in assessment.blockers
+            if not (allow_conflicts and overridable(b))
+        ]
+        if fatal:
+            raise NotUndoable("; ".join(fatal))
         conflicts = assessment.conflicts
         if conflicts and not allow_conflicts:
             raise UndoConflict(

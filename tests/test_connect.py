@@ -285,3 +285,54 @@ def test_a_required_engine_cannot_be_skipped():
         assert conftest.require("postgres", "postgresql://h/d", "X") is None
     finally:
         conftest.REQUIRED = real
+
+
+# -- the database's own errors reach the user, not a traceback --------------
+
+
+@pytest.mark.parametrize(
+    "sql,fragment",
+    [
+        ("UPDATE nosuchtable SET x = 1 WHERE id = 1", "nosuchtable"),
+        ("SELECT * FROM nosuchtable", "nosuchtable"),
+        ("this is not sql at all", "syntax"),
+    ],
+)
+def test_a_database_error_is_reported_not_traced(tmp_path, capsys, sql, fragment):
+    """A typo in your SQL should read like a typo, not like a crash.
+
+    Found by running this project's own README instructions: a mistyped table
+    name produced a raw sqlite3.OperationalError traceback, while `track` had
+    handled the same mistake cleanly for months. `psql` prints the database's
+    complaint and so do we -- a stack trace tells the user nothing they can act
+    on and makes their mistake look like our bug.
+    """
+    from ctrlz.cli import main
+
+    path = tmp_path / "e.db"
+    main(["--dsn", f"sqlite:///{path}", "init"])
+    capsys.readouterr()
+
+    code = main(["--dsn", f"sqlite:///{path}", "run", sql])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "Traceback" not in captured.err and "Traceback" not in captured.out
+    assert captured.err.startswith("ctrlz:") or "ctrlz:" in captured.err
+    assert fragment in captured.err.lower()
+
+
+def test_the_database_error_handler_covers_the_installed_drivers():
+    """Built from whichever drivers are present, via PEP 249's `Error` base."""
+    import sqlite3
+
+    from ctrlz.cli import _database_errors
+
+    errors = _database_errors()
+    assert sqlite3.Error in errors
+    for module in ("psycopg2", "pymysql"):
+        try:
+            driver = __import__(module)
+        except ImportError:
+            continue
+        assert driver.Error in errors, f"{module} is installed but not handled"

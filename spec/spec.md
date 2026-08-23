@@ -482,6 +482,48 @@ The specification is satisfied when all of the following hold:
 | Central store becomes a perceived source of truth | undo run against stale data | undo only ever executes against the source DB (FR-6.4) |
 | Generated trigger SQL is an injection surface | attacker-chosen text in a trigger a privileged user creates | identifiers *and* literals escaped per engine; hostile-name suite on all three (found in a pre-release audit, §11) |
 
+### Closed: a silent partial undo after a schema change
+
+Found by an external reviewer, not by us, and it is the most serious defect in
+the project's history: `preview` said `UNDOABLE clean`, `undo` said it had
+worked, and one column silently kept its wrong value.
+
+SQLite and MySQL name every column in the trigger body, fixed when `track`
+runs. `ALTER TABLE ... ADD COLUMN` does not rebuild the trigger, so every
+capture after that point is missing a column — and the drift check compared
+only the columns it had, so it saw nothing wrong.
+
+**A partial restore presented as a complete one is worse than no undo at all,
+because the user stops looking.** The operation is now blocked, with the
+remedy named. It is blocked rather than best-effort repaired because we cannot
+tell whether the column was added before the write (the capture is genuinely
+incomplete) or after it (the row never had a value to restore) — and guessing
+between "your data is fine" and "your data is not" is the guess this tool
+exists to avoid. `--allow-conflicts` overrides it, and overrides *only* it:
+rows lost to a MySQL cascade stay unrecoverable and no flag says otherwise.
+
+**PostgreSQL never had the bug**, because `to_jsonb(OLD)` serialises whatever
+columns exist when the trigger fires. That is now pinned by a test, since it is
+a real property of that design and easy to lose in a rewrite.
+
+### Closed: three defects that only appeared on Windows
+
+From the same review. Together they meant a Windows user could commit a bad
+write and then be unable to reverse it through the documented path.
+
+* **The console could not encode the output.** `preview` renders `→`, and
+  Windows still defaults to a legacy code page: `UnicodeEncodeError`, raised by
+  `undo` *before it applied anything*. Both `→` and `…` now fall back to ASCII
+  when the stream cannot take them — `…` included because cp1252 carries it and
+  cp437 does not, so testing one code page proved nothing about the other.
+* **`C:\path\app.db` was read as a URL with scheme `c`.** A single letter is
+  never a real scheme, so a drive letter is now recognised as a path.
+* **The suite would not collect at all.** `os.getuid` inside a `skipif`
+  decorator runs at import, and does not exist on Windows — so the one platform
+  with unique failure modes was the one platform that could not run the tests
+  that would have caught them. Now guarded, and a test walks every module's AST
+  to keep it that way.
+
 ### Closed: the gateway could exhaust the database's connection limit
 
 The gateway opens **one upstream database connection per client**, and had no

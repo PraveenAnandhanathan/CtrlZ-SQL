@@ -72,6 +72,62 @@ jobs:
 
       - name: Check the package installs and runs from a built wheel
         # Everything above runs from a source checkout with dev extras. What a
+        # user actually gets is the wheel, and only this step tests that.
+        run: |
+          python -m pip install --quiet build
+          python -m build --wheel --outdir dist_check
+
+          # (a) A bare install: SQLite only, no optional drivers. Proves the
+          #     base package stands on its own.
+          python -m venv /tmp/bare
+          /tmp/bare/bin/pip install --quiet dist_check/*.whl
+          /tmp/bare/bin/ctrlz --version
+          /tmp/bare/bin/ctrlz --dsn sqlite:///$RUNNER_TEMP/w.db init
+          /tmp/bare/bin/ctrlz --dsn sqlite:///$RUNNER_TEMP/w.db doctor
+          # Both entry points, from a directory containing no ctrlz/ -- run
+          # from the repo root the source tree shadows the install and this
+          # would prove nothing.
+          cd "$RUNNER_TEMP" && /tmp/bare/bin/python -m ctrlz --version
+          cd "$GITHUB_WORKSPACE"
+
+          # (b) With the optional drivers, so every module can be imported.
+          #     A module dropped from packaging passes the entire suite above,
+          #     because the suite imports from the source checkout where it
+          #     obviously exists. A reviewer's first guess at a broken install
+          #     was exactly that, and nothing could answer them quickly.
+          python -m venv /tmp/full
+          /tmp/full/bin/pip install --quiet "$(ls dist_check/*.whl)[postgres,mysql]"
+          cd "$RUNNER_TEMP"
+          /tmp/full/bin/python - <<'CHECK'
+          import importlib, pathlib
+          import ctrlz
+
+          root = pathlib.Path(ctrlz.__file__).parent
+          names = []
+          for path in sorted(root.rglob("*.py")):
+              if "__pycache__" in path.parts or path.stem == "__main__":
+                  continue
+              parts = [p for p in path.relative_to(root).with_suffix("").parts
+                       if p != "__init__"]
+              names.append(".".join(["ctrlz", *parts]))
+
+          assert len(names) >= 15, f"only found {names}"
+          for name in names:
+              importlib.import_module(name)
+          assert (root / "policy" / "defaults.yaml").is_file(), "rulebook not packaged"
+          assert (root / "py.typed").is_file(), "typing marker not packaged"
+          print(f"{len(names)} modules imported from the installed wheel")
+          CHECK
+
+      - name: Publish the benchmark numbers
+        # Spec §10.6: benchmarks must run in CI *and publish numbers*. Asserting
+        # a budget only says nothing collapsed; the numbers say what it costs
+        # and which way that is moving. They land in the job summary.
+        if: matrix.python == '3.12'
+        run: pytest tests/test_benchmark.py -q -p no:warnings
+
+      - name: Check the package installs and runs from a built wheel
+        # Everything above runs from a source checkout with dev extras. What a
         # user actually gets is the wheel, and only this step tests that -- the
         # policy file being packaged, the console script existing, the import
         # graph working without the dev dependencies present.
@@ -83,3 +139,31 @@ jobs:
           /tmp/wheelcheck/bin/ctrlz --version
           /tmp/wheelcheck/bin/ctrlz --dsn sqlite:///$RUNNER_TEMP/w.db init
           /tmp/wheelcheck/bin/ctrlz --dsn sqlite:///$RUNNER_TEMP/w.db doctor
+          # Both entry points, from a directory with no ctrlz/ in it -- run
+          # from the repo root, the source tree shadows the install and this
+          # proves nothing.
+          cd "$RUNNER_TEMP"
+          /tmp/wheelcheck/bin/python -m ctrlz --version
+          # Every module, from the wheel. A module dropped from packaging
+          # passes the whole suite above, because the suite imports from the
+          # source checkout where it obviously exists. A reviewer's first
+          # guess at a broken install was exactly this, and nothing could
+          # have answered them quickly.
+          /tmp/wheelcheck/bin/python - <<'CHECK'
+          import importlib, pathlib, sys
+          import ctrlz
+          root = pathlib.Path(ctrlz.__file__).parent
+          names = []
+          for path in sorted(root.rglob("*.py")):
+              if "__pycache__" in path.parts or path.stem == "__main__":
+                  continue
+              parts = [p for p in path.relative_to(root).with_suffix("").parts
+                       if p != "__init__"]
+              names.append(".".join(["ctrlz", *parts]))
+          assert len(names) >= 15, f"only found {names}"
+          for name in names:
+              importlib.import_module(name)
+          assert (root / "policy" / "defaults.yaml").is_file(), "rulebook not packaged"
+          assert (root / "py.typed").is_file(), "typing marker not packaged"
+          print(f"{len(names)} modules imported from the installed wheel")
+          CHECK

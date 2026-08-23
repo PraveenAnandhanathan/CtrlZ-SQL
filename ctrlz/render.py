@@ -38,6 +38,43 @@ _COLORS = {
 }
 
 
+#: How a value change is drawn. "→" is clearer, and Windows consoles still
+#: default to a legacy code page that cannot encode it -- printing it there
+#: raised UnicodeEncodeError from inside `preview`, and from `undo` *before it
+#: applied anything*. A user could commit a bad write and then be unable to
+#: reverse it through the documented path, which turns a cosmetic issue into a
+#: data-recovery one.
+#:
+#: Decided once at import from what stdout can actually encode, rather than
+#: from the platform name: a Windows terminal running UTF-8 gets the arrow, and
+#: a redirected or piped stream that cannot take it gets "->".
+def _printable(preferred: str, fallback: str) -> str:
+    """`preferred` if the console can encode it, else `fallback`."""
+    import sys
+
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        preferred.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return fallback
+    return preferred
+
+
+def _arrow() -> str:
+    return _printable("\u2192", "->")
+
+
+def _ellipsis() -> str:
+    return _printable("\u2026", "...")
+
+
+ARROW = _arrow()
+#: cp1252 happens to carry U+2026, but cp437 and cp850 -- also common Windows
+#: console code pages -- do not, so it goes through the same check rather than
+#: relying on one code page's luck.
+ELLIPSIS = _ellipsis()
+
+
 def use_color() -> bool:
     if os.environ.get("NO_COLOR"):
         return False
@@ -75,7 +112,7 @@ def ago(when: Optional[datetime]) -> str:
 def truncate(value: Any, width: int = 40) -> str:
     text = "NULL" if value is None else str(value)
     text = text.replace("\n", "\\n")
-    return text if len(text) <= width else text[: width - 1] + "…"
+    return text if len(text) <= width else text[: width - 1] + ELLIPSIS
 
 
 def table(rows: list[list[str]], headers: list[str]) -> str:
@@ -241,7 +278,7 @@ def format_preview(assessment: Undoability, max_rows: int = 20) -> str:
         lines.extend(format_row(verdict))
         shown += 1
     if len(assessment.verdicts) > shown:
-        lines.append(c(f"  … and {len(assessment.verdicts) - shown} more row(s)", "dim"))
+        lines.append(c(f"  {ELLIPSIS} and {len(assessment.verdicts) - shown} more row(s)", "dim"))
     if assessment.verdicts:
         lines.append("")
 
@@ -270,7 +307,7 @@ def format_row(verdict: RowVerdict) -> list[str]:
     if change.action == UPDATE:
         for column, old, new in diff_columns(change.before, change.after):
             lines.append(
-                f"      {column}: {c(truncate(new), 'red')} → {c(truncate(old), 'green')}"
+                f"      {column}: {c(truncate(new), 'red')} {ARROW} {c(truncate(old), 'green')}"
             )
     elif change.action == DELETE:
         preview = ", ".join(
